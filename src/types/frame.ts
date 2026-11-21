@@ -76,8 +76,19 @@ export interface RenderConfig {
 
 /**
  * A 2D affine transform stored as a 3x3 matrix in **column-major** order, matching
- * WGSL's `mat3x3<f32>` memory layout: `[m00, m01, m02, m10, m11, m12, m20, m21, m22]`
- * where `m20`/`m21` hold the translation and `m22` is the homogeneous scale.
+ * WGSL's `mat3x3<f32>` memory layout: `[m00, m01, m02, m10, m11, m12, m20, m21, m22]`.
+ *
+ * Naming is `mCR` = column `C`, row `R`, so each consecutive triple is one column:
+ *
+ * ```
+ * | m00  m10  m20 |   | a  c  tx |
+ * | m01  m11  m21 | = | b  d  ty |
+ * | m02  m12  m22 |   | 0  0   1 |
+ * ```
+ *
+ * `m20`/`m21` therefore hold the translation and `m22` is the homogeneous scale.
+ * Points transform as `x' = m00*x + m10*y + m20`, `y' = m01*x + m11*y + m21`.
+ * `math/mat3.ts` is the authority for building and combining these matrices.
  */
 export type AffineMatrix = readonly [
   m00: number, m01: number, m02: number,
