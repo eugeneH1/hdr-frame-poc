@@ -220,12 +220,13 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   const stats = createElement('dl', 'wb-stats');
   const frameStat = createStat('Frames');
   const elapsedStat = createStat('Elapsed');
-  const timingStat = createStat('Throughput');
+  const timingStat = createStat('Frame time');
   const peakStat = createStat('Peak (sampled)');
   const sampleStat = createStat('Center pixel RGBA');
   const readbackStat = createStat('Readback');
   const targetStat = createStat('Active HDR target');
   const retainedStat = createStat('Retained');
+  const fpsStat = createStat('FPS');
   stats.append(
     frameStat.cell,
     elapsedStat.cell,
@@ -235,6 +236,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     readbackStat.cell,
     targetStat.cell,
     retainedStat.cell,
+    fpsStat.cell,
   );
 
   const note = createElement(
@@ -267,9 +269,14 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     elapsedStat.value.textContent = `${Math.round(snapshot.elapsedMs ?? 0)} ms`;
 
     timingStat.value.textContent =
-      snapshot.measuredFps > 0
-        ? `${snapshot.measuredFps.toFixed(1)} fps · ${snapshot.lastFrameMs.toFixed(1)} ms`
+      snapshot.framesCompleted > 0
+        ? `${snapshot.lastFrameMs.toFixed(1)} ms · avg ${snapshot.averageFrameMs.toFixed(1)} ms`
         : '—';
+
+    // Frames completed per second over the pipeline's sliding timing window.
+    // Two decimals so small frame-to-frame jitter stays visible.
+    fpsStat.value.textContent =
+      snapshot.measuredFps > 0 ? snapshot.measuredFps.toFixed(2) : '—';
 
     const values = snapshot.lastFrameValues;
     peakStat.value.textContent = values
