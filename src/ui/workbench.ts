@@ -1,29 +1,49 @@
 /**
  * Workbench DOM setup (plain TypeScript + HTML, no framework).
  *
- * Responsibility: build the POC's minimal UI — a preview `<canvas>`, Run / Cancel
- * controls, and a status/telemetry readout — and expose a small API the entry point
- * uses to drive a run. It deliberately contains no rendering logic: the workbench
- * only creates a fresh `RenderConfig`, starts/cancels `runFramePipeline`, and
- * renders the telemetry it receives.
+ * Responsibility: build the POC's minimal UI — a preview `<canvas>`, Start /
+ * Cancel controls, an HDR-target format selector, and a status/telemetry
+ * readout — and wire it to `runFramePipeline`. It deliberately contains no
+ * rendering logic: all GPU state stays in `src/gpu/` and `src/pipeline/`, while
+ * this module owns DOM state and event listeners.
  *
  * Design assumptions:
- * - The canvas is sized to the run's `width`/`height` design dimensions; CSS may
- *   scale it down while the backing store stays at native resolution.
- * - Cancel maps to an `AbortController`; the workbench never touches GPU objects.
+ * - The canvas backing store is 1280x720 (matching the design space); CSS keeps
+ *   it aspect-aware and scales it down on narrow screens.
+ * - Cancel maps to an `AbortController` passed to the pipeline as an
+ *   `AbortSignal`; the workbench never touches GPU objects.
+ * - Telemetry arrives already throttled by the pipeline; `updateTelemetry`
+ *   merely formats it into stable DOM nodes.
  */
 
-import type { RenderConfig, TelemetrySnapshot } from '../types/frame.ts';
+import type { ColorSpaceSpec, RenderConfig, TelemetrySnapshot } from '../types/frame.ts';
+import { getWorkingColorSpace } from '../timeline/sceneAnimator.ts';
+import { runFramePipeline } from '../pipeline/framePipeline.ts';
+
+const DEFAULT_WIDTH = 1280;
+const DEFAULT_HEIGHT = 720;
+const DEFAULT_FPS = 30;
+const DEFAULT_FRAME_COUNT = 300;
+
+/** Fixed run parameters plus the user-selectable HDR target format. */
+export interface WorkbenchRunOptions {
+  readonly width: number;
+  readonly height: number;
+  readonly fps: number;
+  readonly frameCount: number;
+  /** Requested offscreen HDR format; the GPU layer may fall back if unsupported. */
+  readonly renderFormat: GPUTextureFormat;
+}
 
 /** Options accepted when mounting the workbench. */
 export interface WorkbenchOptions {
   /** Element to render the workbench into (typically `#app`). */
   readonly root: HTMLElement;
   /**
-   * Builds the pristine `RenderConfig` for a run. Called once per Run press so the
-   * session can reset any derived state. Defaults to the POC's 1280x720/30fps/300.
+   * Builds the pristine `RenderConfig` for a run from the current UI selection.
+   * Called once per Start press. Defaults to the POC's 1280x720/30fps/300 config.
    */
-  readonly createConfig?: () => RenderConfig;
+  readonly createConfig?: (selection: WorkbenchRunOptions) => RenderConfig;
 }
 
 /** Handles onto the workbench's DOM and run controls. */
@@ -42,16 +62,339 @@ export interface Workbench {
   unmount(): void;
 }
 
+type WorkbenchState = 'idle' | 'running' | 'cancelling' | 'cancelled' | 'done' | 'error';
+
+interface StatCell {
+  readonly cell: HTMLDivElement;
+  readonly value: HTMLElement;
+}
+
+function createElement<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  className?: string,
+  text?: string,
+): HTMLElementTagNameMap[K] {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
+
+function createOption(value: string, label: string, disabled = false): HTMLOptionElement {
+  const option = document.createElement('option');
+  option.value = value;
+  option.textContent = label;
+  option.disabled = disabled;
+  return option;
+}
+
+function createStat(label: string): StatCell {
+  const cell = createElement('div', 'wb-stat');
+  const term = createElement('dt', 'wb-stat-label', label);
+  const value = createElement('dd', 'wb-stat-value', '—');
+  cell.append(term, value);
+  return { cell, value };
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function formatFixed(value: number, digits = 3): string {
+  return Number.isFinite(value) ? value.toFixed(digits) : '—';
+}
+
+function formatMegabytes(bytes: number): string {
+  return (bytes / (1024 * 1024)).toFixed(1);
+}
+
+/** Rec. 2100 PQ delivery space used as the default output description. */
+function getRec2100PqColorSpace(): ColorSpaceSpec {
+  return {
+    name: 'Rec.2100-PQ',
+    redPrimary: [0.708, 0.292],
+    greenPrimary: [0.17, 0.797],
+    bluePrimary: [0.131, 0.046],
+    whitePoint: [0.3127, 0.329],
+    transfer: 'pq',
+    peakLuminanceNits: 1000,
+  };
+}
+
+function createDefaultConfig(selection: WorkbenchRunOptions): RenderConfig {
+  return {
+    width: selection.width,
+    height: selection.height,
+    fps: selection.fps,
+    frameCount: selection.frameCount,
+    workingColorSpace: getWorkingColorSpace(),
+    outputColorSpace: getRec2100PqColorSpace(),
+    renderFormat: selection.renderFormat,
+    seed: 1,
+  };
+}
+
+/**
+ * Probes whether the adapter can render *and* blend into `rgba32float`, which is
+ * the pair of features `initGpuContext` requires before selecting that format.
+ */
+async function detectFloat32RenderTargetSupport(): Promise<boolean> {
+  if (typeof navigator === 'undefined' || !navigator.gpu) return false;
+  try {
+    const adapter =
+      (await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })) ??
+      (await navigator.gpu.requestAdapter());
+    if (!adapter) return false;
+    return (
+      adapter.features.has('float32-renderable' as GPUFeatureName) &&
+      adapter.features.has('float32-blendable' as GPUFeatureName)
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Mounts the workbench UI into `options.root`.
  *
- * Intended steps: create the canvas, Run/Cancel buttons, and status `<pre>`; wire
- * button handlers to `runFramePipeline` with `callbacks.onTelemetry` feeding
- * `updateTelemetry`; manage the active `AbortController`.
+ * Creates the canvas, controls, and telemetry grid, wires Start/Cancel to
+ * `runFramePipeline`, and manages the active `AbortController`. Format
+ * capability probing runs asynchronously and only enables `rgba32float` when the
+ * adapter exposes both required features.
  *
  * @param options - Mount target and optional config factory.
  * @returns A `Workbench` handle for programmatic control.
  */
-export function mountWorkbench(_options: WorkbenchOptions): Workbench {
-  throw new Error('ui.workbench.mountWorkbench: not implemented');
+export function mountWorkbench(options: WorkbenchOptions): Workbench {
+  const { root } = options;
+  const createConfig = options.createConfig ?? createDefaultConfig;
+  const webgpuAvailable =
+    typeof navigator !== 'undefined' && 'gpu' in navigator && Boolean(navigator.gpu);
+
+  let running = false;
+  let unmounted = false;
+  let activeController: AbortController | null = null;
+
+  // --- Header ----------------------------------------------------------------
+  const container = createElement('div', 'workbench');
+
+  const header = createElement('div', 'wb-header');
+  const headingGroup = createElement('div', 'wb-heading');
+  headingGroup.append(
+    createElement('h1', 'wb-title', 'HDR Frame Workbench'),
+    createElement(
+      'p',
+      'wb-subtitle',
+      'Deterministic 300-frame linear Rec. 2020 render, previewed through an SDR tone-mapping pass.',
+    ),
+  );
+
+  const stateBadge = createElement('span', 'wb-state', 'Idle');
+  stateBadge.dataset.state = 'idle';
+
+  const controls = createElement('div', 'wb-controls');
+  const formatField = createElement('label', 'wb-field');
+  const formatSelect = createElement('select', 'wb-select');
+  const option16 = createOption('rgba16float', 'rgba16float');
+  const option32 = createOption('rgba32float', 'rgba32float (checking…)', true);
+  formatSelect.append(option16, option32);
+  formatField.append(createElement('span', 'wb-field-label', 'HDR target'), formatSelect);
+
+  const startButton = createElement('button', 'wb-button wb-button--primary', 'Start');
+  startButton.type = 'button';
+  const cancelButton = createElement('button', 'wb-button', 'Cancel');
+  cancelButton.type = 'button';
+  cancelButton.disabled = true;
+
+  controls.append(formatField, startButton, cancelButton);
+  header.append(headingGroup, stateBadge);
+
+  // --- Preview stage ---------------------------------------------------------
+  const stage = createElement('div', 'wb-stage');
+  const canvas = createElement('canvas', 'wb-canvas');
+  canvas.width = DEFAULT_WIDTH;
+  canvas.height = DEFAULT_HEIGHT;
+  stage.append(canvas);
+
+  // --- Telemetry -------------------------------------------------------------
+  const stats = createElement('dl', 'wb-stats');
+  const frameStat = createStat('Frames');
+  const elapsedStat = createStat('Elapsed');
+  const timingStat = createStat('Throughput');
+  const peakStat = createStat('Peak (sampled)');
+  const sampleStat = createStat('Center pixel RGBA');
+  const readbackStat = createStat('Readback');
+  const targetStat = createStat('Active HDR target');
+  const retainedStat = createStat('Retained');
+  stats.append(
+    frameStat.cell,
+    elapsedStat.cell,
+    timingStat.cell,
+    peakStat.cell,
+    sampleStat.cell,
+    readbackStat.cell,
+    targetStat.cell,
+    retainedStat.cell,
+  );
+
+  const note = createElement(
+    'p',
+    'wb-note',
+    'Frames are streamed: each Float32 frame (~14.75 MB at 1280×720) is released after readback, ' +
+      'so a 300-frame run never retains all frames (~4.4 GB if it did).',
+  );
+
+  const warningEl = createElement('p', 'wb-warning');
+  warningEl.hidden = true;
+
+  container.append(header, stage, controls, stats, note, warningEl);
+  root.replaceChildren(container);
+
+  function setState(state: WorkbenchState, label: string): void {
+    stateBadge.dataset.state = state;
+    stateBadge.textContent = label;
+  }
+
+  function showWarning(message: string): void {
+    warningEl.hidden = message.length === 0;
+    warningEl.textContent = message;
+  }
+
+  function updateTelemetry(snapshot: TelemetrySnapshot): void {
+    // `framesCompleted` is a count (0..total), so the final sample reads
+    // `300 / 300` rather than the last 0-based frame index (`299`).
+    frameStat.value.textContent = `${snapshot.framesCompleted} / ${snapshot.framesTotal}`;
+    elapsedStat.value.textContent = `${Math.round(snapshot.elapsedMs ?? 0)} ms`;
+
+    timingStat.value.textContent =
+      snapshot.measuredFps > 0
+        ? `${snapshot.measuredFps.toFixed(1)} fps · ${snapshot.lastFrameMs.toFixed(1)} ms`
+        : '—';
+
+    const values = snapshot.lastFrameValues;
+    peakStat.value.textContent = values
+      ? `${formatFixed(values.min)} – ${formatFixed(values.max)}`
+      : '—';
+    sampleStat.value.textContent = values
+      ? values.sample.map((channel) => formatFixed(channel, 2)).join(', ')
+      : '—';
+
+    readbackStat.value.textContent = `${formatMegabytes(snapshot.readbackBytes)} MB`;
+    retainedStat.value.textContent = `${formatMegabytes(snapshot.retainedBytes)} MB`;
+    if (snapshot.renderFormat) targetStat.value.textContent = snapshot.renderFormat;
+
+    if (snapshot.warnings.length > 0) {
+      showWarning(snapshot.warnings.join('\n'));
+    }
+  }
+
+  async function run(): Promise<void> {
+    if (running || unmounted) return;
+
+    if (!webgpuAvailable) {
+      showWarning('WebGPU is not available in this browser; cannot start a run.');
+      setState('error', 'Unsupported');
+      return;
+    }
+
+    running = true;
+    startButton.disabled = true;
+    cancelButton.disabled = false;
+    formatSelect.disabled = true;
+    showWarning('');
+    setState('running', 'Running');
+
+    const controller = new AbortController();
+    activeController = controller;
+
+    const selection: WorkbenchRunOptions = {
+      width: DEFAULT_WIDTH,
+      height: DEFAULT_HEIGHT,
+      fps: DEFAULT_FPS,
+      frameCount: DEFAULT_FRAME_COUNT,
+      renderFormat: formatSelect.value === 'rgba32float' ? 'rgba32float' : 'rgba16float',
+    };
+    const config = createConfig(selection);
+
+    // The preview swap chain is sized from the canvas drawing buffer, so it must
+    // be set before the pipeline creates the preview renderer.
+    canvas.width = config.width;
+    canvas.height = config.height;
+    targetStat.value.textContent = selection.renderFormat;
+
+    try {
+      const summary = await runFramePipeline({
+        config,
+        previewCanvas: canvas,
+        signal: controller.signal,
+        callbacks: {
+          onTelemetry: updateTelemetry,
+          onWarning: showWarning,
+        },
+      });
+
+      updateTelemetry(summary.telemetry);
+      setState(summary.cancelled ? 'cancelled' : 'done', summary.cancelled ? 'Cancelled' : 'Complete');
+    } catch (error) {
+      setState('error', 'Error');
+      showWarning(`Run failed: ${describeError(error)}`);
+    } finally {
+      if (activeController === controller) activeController = null;
+      running = false;
+      if (!unmounted) {
+        startButton.disabled = !webgpuAvailable;
+        cancelButton.disabled = true;
+        formatSelect.disabled = false;
+      }
+    }
+  }
+
+  function cancel(): void {
+    if (!activeController || activeController.signal.aborted) return;
+    activeController.abort();
+    setState('cancelling', 'Cancelling');
+    cancelButton.disabled = true;
+  }
+
+  function unmount(): void {
+    if (unmounted) return;
+    unmounted = true;
+    activeController?.abort();
+    activeController = null;
+    startButton.removeEventListener('click', onStartClick);
+    cancelButton.removeEventListener('click', onCancelClick);
+    container.remove();
+  }
+
+  function onStartClick(): void {
+    void run();
+  }
+
+  function onCancelClick(): void {
+    cancel();
+  }
+
+  startButton.addEventListener('click', onStartClick);
+  cancelButton.addEventListener('click', onCancelClick);
+
+  if (!webgpuAvailable) {
+    startButton.disabled = true;
+    showWarning('WebGPU is not available in this browser. This POC requires a WebGPU-capable browser.');
+    setState('error', 'Unsupported');
+  } else {
+    void detectFloat32RenderTargetSupport().then((supported) => {
+      if (unmounted) return;
+      option32.disabled = !supported;
+      option32.textContent = supported ? 'rgba32float' : 'rgba32float (unsupported)';
+    });
+  }
+
+  return {
+    canvas,
+    statusEl: stats,
+    run,
+    cancel,
+    updateTelemetry,
+    unmount,
+  };
 }

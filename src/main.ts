@@ -5,8 +5,8 @@ import { mountWorkbench } from './ui/workbench.ts';
  * Application entry point.
  *
  * Responsibility: mount the plain-DOM workbench into `#app`. All rendering logic
- * lives behind `runFramePipeline`, which the workbench invokes on Run; nothing
- * beyond mounting happens here.
+ * lives behind `runFramePipeline`, which the workbench invokes on Start; nothing
+ * beyond mounting (and dev-server teardown) happens here.
  */
 
 const root = document.querySelector<HTMLDivElement>('#app');
@@ -15,4 +15,12 @@ if (!root) {
   throw new Error('main: expected a #app root element in index.html');
 }
 
-mountWorkbench({ root });
+const workbench = mountWorkbench({ root });
+
+// Tear down the active run and DOM on Vite HMR updates so a reload cannot leave
+// an AbortController or GPU device alive behind a detached workbench.
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    workbench.unmount();
+  });
+}

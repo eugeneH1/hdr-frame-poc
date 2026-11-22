@@ -232,6 +232,25 @@ export interface FloatFrame {
   release(): void;
 }
 
+/**
+ * Sampled pixel statistics for one frame.
+ *
+ * A full min/max scan of a 1280x720 RGBA frame touches ~3.7M floats, so the
+ * pipeline samples RGB values on a fixed pixel stride for cheap, deterministic
+ * telemetry. `sample` reports one complete RGBA pixel (the frame center) so the
+ * UI can show concrete linear values alongside the range.
+ */
+export interface FrameValueStats {
+  /** Smallest sampled linear RGB channel value. */
+  readonly min: number;
+  /** Largest sampled linear RGB channel value (peaks above 1.0 indicate HDR). */
+  readonly max: number;
+  /** Center pixel RGBA in linear working-space units. */
+  readonly sample: readonly [r: number, g: number, b: number, a: number];
+  /** Number of pixels actually inspected to produce `min`/`max`. */
+  readonly sampledPixels: number;
+}
+
 /** Counters and timing values sampled while a render run is in progress. */
 export interface TelemetrySnapshot {
   /** Frames fully produced so far in the current run. */
@@ -250,4 +269,12 @@ export interface TelemetrySnapshot {
   readonly retainedBytes: number;
   /** Non-fatal problems encountered (e.g. dropped preview frame). */
   readonly warnings: readonly string[];
+  /** Zero-based index of the most recently completed frame, or -1 before any. */
+  readonly lastFrameIndex?: number;
+  /** Wall-clock milliseconds elapsed since the run began. */
+  readonly elapsedMs?: number;
+  /** Actual HDR target format in use (may fall back from the requested format). */
+  readonly renderFormat?: GPUTextureFormat;
+  /** Sampled value statistics for the most recently completed frame. */
+  readonly lastFrameValues?: FrameValueStats;
 }

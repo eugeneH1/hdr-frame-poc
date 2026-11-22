@@ -25,7 +25,9 @@
 // - The background is opaque and also written premultiplied for consistency.
 
 struct BackgroundUniforms {
-  from: vec4<f32>,
+  // `from` is a reserved word in WGSL (see WGSL spec §16.2), so the gradient
+  // start color uses a non-reserved member name.
+  fromColor: vec4<f32>,
   to: vec4<f32>,
 };
 
@@ -65,8 +67,8 @@ fn vsBackground(@builtin(vertex_index) vertexIndex: u32) -> BackgroundOut {
 fn fsBackground(in: BackgroundOut) -> @location(0) vec4<f32> {
   // Smooth vertical gradient between the scene's two linear HDR colors.
   let t = smoothstep(0.0, 1.0, clamp(in.uv.y, 0.0, 1.0));
-  let rgb = mix(background.from.rgb, background.to.rgb, t);
-  let alpha = mix(background.from.a, background.to.a, t);
+  let rgb = mix(background.fromColor.rgb, background.to.rgb, t);
+  let alpha = mix(background.fromColor.a, background.to.a, t);
   return vec4<f32>(rgb * alpha, alpha);
 }
 

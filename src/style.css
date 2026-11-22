@@ -294,3 +294,231 @@ code {
     border-right-color: var(--border);
   }
 }
+
+/* --- HDR workbench ------------------------------------------------------- */
+
+.workbench {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 28px 24px 36px;
+  text-align: left;
+}
+
+.wb-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.wb-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wb-title {
+  margin: 0;
+  font-size: 28px;
+  letter-spacing: -0.6px;
+}
+
+.wb-subtitle {
+  margin: 0;
+  max-width: 62ch;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.wb-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text);
+  background: var(--code-bg);
+  white-space: nowrap;
+}
+
+.wb-state::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.wb-state[data-state='running'] {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+}
+
+.wb-state[data-state='done'] {
+  color: #15803d;
+}
+
+.wb-state[data-state='cancelled'],
+.wb-state[data-state='cancelling'] {
+  color: #b45309;
+}
+
+.wb-state[data-state='error'] {
+  color: #b91c1c;
+}
+
+.wb-stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #000;
+  box-shadow: var(--shadow);
+}
+
+.wb-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.wb-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.wb-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wb-field-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text);
+}
+
+.wb-select {
+  font: inherit;
+  font-size: 14px;
+  padding: 8px 10px;
+  min-width: 190px;
+  color: var(--text-h);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.wb-button {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  padding: 8px 18px;
+  color: var(--text-h);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s, opacity 0.2s;
+}
+
+.wb-button:hover:not(:disabled) {
+  border-color: var(--accent-border);
+}
+
+.wb-button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.wb-button--primary {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.wb-button--primary:hover:not(:disabled) {
+  border-color: var(--accent-border);
+  filter: brightness(1.05);
+}
+
+.wb-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.wb-stat {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--code-bg);
+}
+
+.wb-stat-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text);
+}
+
+.wb-stat-value {
+  margin: 4px 0 0;
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 140%;
+  color: var(--text-h);
+  overflow-wrap: anywhere;
+}
+
+.wb-note {
+  margin: 0;
+  font-size: 13px;
+  line-height: 150%;
+  color: var(--text);
+}
+
+.wb-warning {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(185, 28, 28, 0.35);
+  border-radius: 8px;
+  background: rgba(185, 28, 28, 0.08);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 150%;
+  white-space: pre-wrap;
+  color: #b91c1c;
+}
+
+@media (max-width: 700px) {
+  .workbench {
+    padding: 20px 14px 28px;
+  }
+
+  .wb-title {
+    font-size: 22px;
+  }
+
+  .wb-stats {
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  }
+}
