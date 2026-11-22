@@ -413,6 +413,26 @@ code {
   color: var(--text);
 }
 
+.wb-field--inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 8px;
+  cursor: pointer;
+}
+
+.wb-checkbox {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.wb-checkbox:disabled {
+  cursor: default;
+}
+
 .wb-select {
   font: inherit;
   font-size: 14px;

@@ -16,9 +16,17 @@
  *   merely formats it into stable DOM nodes.
  */
 
-import type { ColorSpaceSpec, RenderConfig, TelemetrySnapshot } from '../types/frame.ts';
+import type {
+  ColorSpaceSpec,
+  EncoderTelemetry,
+  FrameMeta,
+  RenderConfig,
+  TelemetrySnapshot,
+} from '../types/frame.ts';
 import { getWorkingColorSpace } from '../timeline/sceneAnimator.ts';
 import { runFramePipeline } from '../pipeline/framePipeline.ts';
+import { createVideoEncoderTap, flushAndClose } from '../encoder/webCodecsTap.ts';
+import type { VideoEncoderTap } from '../encoder/webCodecsTap.ts';
 
 const DEFAULT_WIDTH = 1280;
 const DEFAULT_HEIGHT = 720;
@@ -134,6 +142,20 @@ function createDefaultConfig(selection: WorkbenchRunOptions): RenderConfig {
   };
 }
 
+/** Minimal frame metadata for probing encoder dimensions/rate before frame 0. */
+function createEncoderProbeMeta(config: RenderConfig): FrameMeta {
+  return {
+    frameIndex: 0,
+    timestampUs: 0,
+    durationUs: Math.round(1e6 / config.fps),
+    width: config.width,
+    height: config.height,
+    colorSpace: config.workingColorSpace,
+    format: config.renderFormat,
+    renderTimeMs: 0,
+  };
+}
+
 /**
  * Probes whether the adapter can render *and* blend into `rgba32float`, which is
  * the pair of features `initGpuContext` requires before selecting that format.
@@ -170,6 +192,8 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   const createConfig = options.createConfig ?? createDefaultConfig;
   const webgpuAvailable =
     typeof navigator !== 'undefined' && 'gpu' in navigator && Boolean(navigator.gpu);
+  const webCodecsAvailable =
+    typeof VideoEncoder !== 'undefined' && typeof VideoFrame !== 'undefined';
 
   let running = false;
   let unmounted = false;
@@ -206,7 +230,21 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   cancelButton.type = 'button';
   cancelButton.disabled = true;
 
-  controls.append(formatField, startButton, cancelButton);
+  const encoderField = createElement('label', 'wb-field wb-field--inline');
+  const encoderToggle = document.createElement('input');
+  encoderToggle.type = 'checkbox';
+  encoderToggle.className = 'wb-checkbox';
+  encoderToggle.checked = false;
+  encoderToggle.disabled = !webCodecsAvailable;
+  if (!webCodecsAvailable) {
+    encoderToggle.title = 'WebCodecs VideoEncoder is not available in this browser.';
+  }
+  encoderField.append(
+    encoderToggle,
+    createElement('span', 'wb-field-label', 'WebCodecs encode'),
+  );
+
+  controls.append(formatField, encoderField, startButton, cancelButton);
   header.append(headingGroup, stateBadge);
 
   // --- Preview stage ---------------------------------------------------------
@@ -221,29 +259,41 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   const frameStat = createStat('Frames');
   const elapsedStat = createStat('Elapsed');
   const timingStat = createStat('Frame time');
+  const renderTimingStat = createStat('Render / preview');
+  const readbackTimingStat = createStat('Readback / unpack');
+  const encodeTimingStat = createStat('Encode (tap)');
   const peakStat = createStat('Peak (sampled)');
   const sampleStat = createStat('Center pixel RGBA');
   const readbackStat = createStat('Readback');
   const targetStat = createStat('Active HDR target');
   const retainedStat = createStat('Retained');
   const fpsStat = createStat('FPS');
+  const encoderStat = createStat('VideoEncoder');
+  const chunksStat = createStat('Encoded chunks');
   stats.append(
     frameStat.cell,
     elapsedStat.cell,
     timingStat.cell,
+    renderTimingStat.cell,
+    readbackTimingStat.cell,
+    encodeTimingStat.cell,
     peakStat.cell,
     sampleStat.cell,
     readbackStat.cell,
     targetStat.cell,
     retainedStat.cell,
     fpsStat.cell,
+    encoderStat.cell,
+    chunksStat.cell,
   );
 
   const note = createElement(
     'p',
     'wb-note',
     'Frames are streamed: each Float32 frame (~14.75 MB at 1280×720) is released after readback, ' +
-      'so a 300-frame run never retains all frames (~4.4 GB if it did).',
+      'so a 300-frame run never retains all frames (~4.4 GB if it did). Enable WebCodecs encode ' +
+      'to pack each frame as I420P10 (RGBA fallback) and feed a Rec. 2100 PQ/HLG encoder; chunk ' +
+      'counts and bytes are tracked here, with muxing left to a future phase.',
   );
 
   const warningEl = createElement('p', 'wb-warning');
@@ -262,6 +312,28 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     warningEl.textContent = message;
   }
 
+  /**
+   * Renders a tap status. `requested` distinguishes "encoder switched off" from
+   * "WebCodecs/profile unavailable", which are very different outcomes for a run.
+   */
+  function updateEncoderReadout(status: EncoderTelemetry | null, requested: boolean): void {
+    if (!status) {
+      encoderStat.value.textContent = requested ? 'Unavailable' : 'Off';
+      chunksStat.value.textContent = '—';
+      if (!requested) encodeTimingStat.value.textContent = '—';
+      return;
+    }
+
+    encoderStat.value.textContent =
+      `${status.state} · ${status.codec} · ${status.frameFormat} · ${status.colorSpace}`;
+    chunksStat.value.textContent =
+      `${status.framesSubmitted} sent · ${status.chunksEmitted} chunks · ` +
+      `${formatMegabytes(status.chunkBytes)} MB · ${status.keyFrames} key · q${status.encodeQueueSize}`;
+    if (status.lastError) {
+      showWarning(`VideoEncoder: ${status.lastError}`);
+    }
+  }
+
   function updateTelemetry(snapshot: TelemetrySnapshot): void {
     // `framesCompleted` is a count (0..total), so the final sample reads
     // `300 / 300` rather than the last 0-based frame index (`299`).
@@ -278,6 +350,26 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     fpsStat.value.textContent =
       snapshot.measuredFps > 0 ? snapshot.measuredFps.toFixed(2) : '—';
 
+    const timing = snapshot.lastFrameTimings;
+    const average = snapshot.averageFrameTimings;
+    renderTimingStat.value.textContent = timing
+      ? `${timing.renderMs.toFixed(1)} / ${timing.previewMs.toFixed(1)} ms` +
+        (average
+          ? ` · avg ${average.renderMs.toFixed(1)} / ${average.previewMs.toFixed(1)}`
+          : '')
+      : '—';
+    readbackTimingStat.value.textContent = timing
+      ? `${timing.readbackMs.toFixed(1)} / ${timing.unpackMs.toFixed(1)} ms` +
+        (average
+          ? ` · avg ${average.readbackMs.toFixed(1)} / ${average.unpackMs.toFixed(1)}`
+          : '')
+      : '—';
+    encodeTimingStat.value.textContent =
+      snapshot.encoder && timing
+        ? `${timing.encodeMs.toFixed(1)} ms` +
+          (average ? ` · avg ${average.encodeMs.toFixed(1)} ms` : '')
+        : '—';
+
     const values = snapshot.lastFrameValues;
     peakStat.value.textContent = values
       ? `${formatFixed(values.min)} – ${formatFixed(values.max)}`
@@ -289,6 +381,8 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     readbackStat.value.textContent = `${formatMegabytes(snapshot.readbackBytes)} MB`;
     retainedStat.value.textContent = `${formatMegabytes(snapshot.retainedBytes)} MB`;
     if (snapshot.renderFormat) targetStat.value.textContent = snapshot.renderFormat;
+
+    updateEncoderReadout(snapshot.encoder ?? null, encoderToggle.checked);
 
     if (snapshot.warnings.length > 0) {
       showWarning(snapshot.warnings.join('\n'));
@@ -308,6 +402,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     startButton.disabled = true;
     cancelButton.disabled = false;
     formatSelect.disabled = true;
+    encoderToggle.disabled = true;
     showWarning('');
     setState('running', 'Running');
 
@@ -322,18 +417,52 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       renderFormat: formatSelect.value === 'rgba32float' ? 'rgba32float' : 'rgba16float',
     };
     const config = createConfig(selection);
+    const wantEncoder = encoderToggle.checked && webCodecsAvailable;
 
     // The preview swap chain is sized from the canvas drawing buffer, so it must
     // be set before the pipeline creates the preview renderer.
     canvas.width = config.width;
     canvas.height = config.height;
     targetStat.value.textContent = selection.renderFormat;
+    encoderStat.value.textContent = wantEncoder ? 'Starting…' : 'Off';
+    chunksStat.value.textContent = '—';
+    encodeTimingStat.value.textContent = '—';
+
+    let encoderTap: VideoEncoderTap | null = null;
 
     try {
+      if (wantEncoder) {
+        encoderTap = await createVideoEncoderTap(
+          createEncoderProbeMeta(config),
+          () => {
+            // Chunk data is intentionally dropped: muxing is out of scope.
+          },
+          {
+            // WebCodecs profiles are tagged Rec.2100 PQ or HLG; linear/unknown
+            // output descriptions fall back to PQ for the encoder metadata.
+            transfer: config.outputColorSpace.transfer === 'hlg' ? 'hlg' : 'pq',
+            onWarning: (message) => showWarning(`Video encoder: ${message}`),
+            onError: (error) => showWarning(`Video encoder: ${error.message}`),
+          },
+        );
+
+        if (!encoderTap) {
+          // `createVideoEncoderTap` reports the specific reason through
+          // `onWarning`; only add a fallback when it was silent.
+          if (warningEl.hidden) {
+            showWarning(
+              'No supported 10-bit HDR VideoEncoder profile; continuing without encoding.',
+            );
+          }
+          updateEncoderReadout(null, true);
+        }
+      }
+
       const summary = await runFramePipeline({
         config,
         previewCanvas: canvas,
         signal: controller.signal,
+        encoderTap,
         callbacks: {
           onTelemetry: updateTelemetry,
           onWarning: showWarning,
@@ -346,12 +475,18 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       setState('error', 'Error');
       showWarning(`Run failed: ${describeError(error)}`);
     } finally {
+      // Guarantees trailing chunks are emitted even if GPU setup failed before
+      // the pipeline's own flush block was reached. Idempotent.
+      await flushAndClose(encoderTap);
+      updateEncoderReadout(encoderTap?.status() ?? null, wantEncoder);
+
       if (activeController === controller) activeController = null;
       running = false;
       if (!unmounted) {
         startButton.disabled = !webgpuAvailable;
         cancelButton.disabled = true;
         formatSelect.disabled = false;
+        encoderToggle.disabled = !webCodecsAvailable;
       }
     }
   }
@@ -370,6 +505,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     activeController = null;
     startButton.removeEventListener('click', onStartClick);
     cancelButton.removeEventListener('click', onCancelClick);
+    encoderToggle.removeEventListener('change', onEncoderToggleChange);
     container.remove();
   }
 
@@ -381,8 +517,14 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     cancel();
   }
 
+  function onEncoderToggleChange(): void {
+    if (!running) updateEncoderReadout(null, encoderToggle.checked);
+  }
+
   startButton.addEventListener('click', onStartClick);
   cancelButton.addEventListener('click', onCancelClick);
+  encoderToggle.addEventListener('change', onEncoderToggleChange);
+  updateEncoderReadout(null, false);
 
   if (!webgpuAvailable) {
     startButton.disabled = true;

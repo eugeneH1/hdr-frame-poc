@@ -202,6 +202,86 @@ export interface FrameMeta {
 }
 
 /**
+ * Per-readback timing and staging-ring diagnostics.
+ *
+ * `waitMs` measures the GPU copy plus `mapAsync` wait, while `unpackMs` is the
+ * CPU-side work of stripping row padding and decoding half floats. `totalMs`
+ * additionally includes any time spent waiting for a staging buffer.
+ */
+export interface ReadbackTiming {
+  /**
+   * Milliseconds from requesting `mapAsync` immediately after copy submission
+   * until it resolved. This measures GPU copy/queue time, not the caller's
+   * deliberate readback lookahead.
+   */
+  readonly waitMs: number;
+  /** Milliseconds spent stripping padding / decoding to `Float32Array`. */
+  readonly unpackMs: number;
+  /** Milliseconds from readback start (including pool wait) to decoded pixels. */
+  readonly totalMs: number;
+  /** Index of the staging buffer that carried this frame's copy. */
+  readonly stagingBufferIndex: number;
+  /** Whether `pixels` points at the manager's shared reuse buffer. */
+  readonly reusedOutputBuffer: boolean;
+}
+
+/**
+ * Wall-clock breakdown for one produced frame, in milliseconds.
+ *
+ * Stages are measured independently so the cost of `rgba16float` versus
+ * `rgba32float` (which primarily affects `readbackMs`/`unpackMs`) can be compared
+ * with rendering and optional encoding work.
+ */
+export interface FrameTimingBreakdown {
+  /** Scene evaluation, command recording, and queue submission. */
+  readonly renderMs: number;
+  /** Recording the preview pass; `0` when preview is disabled. */
+  readonly previewMs: number;
+  /** GPU copy plus `mapAsync` wait. */
+  readonly readbackMs: number;
+  /** CPU row-strip / half-float decode. */
+  readonly unpackMs: number;
+  /** Optional WebCodecs conversion plus `encoder.encode()` call. */
+  readonly encodeMs: number;
+  /** Time spent inside the consumer's `onFrame` callback. */
+  readonly consumerMs: number;
+  /** Wall-clock time from frame start through consumer completion. */
+  readonly totalMs: number;
+}
+
+/** Lifecycle state of the optional WebCodecs tap. */
+export type EncoderTapState = 'configured' | 'closed' | 'errored';
+
+/**
+ * Snapshot of the optional `VideoEncoder` tap. Safe to render in the UI: it
+ * contains counters only, never encoded bytes (muxing is out of scope).
+ */
+export interface EncoderTelemetry {
+  /** Configured / closed / errored state of the encoder. */
+  readonly state: EncoderTapState;
+  /** Codec string accepted by `VideoEncoder.isConfigSupported`. */
+  readonly codec: string;
+  /** Pixel format packed into each `VideoFrame` (`I420P10` or `RGBA`). */
+  readonly frameFormat: string;
+  /** Compact color description, e.g. `bt2020/pq/bt2020-ncl`. */
+  readonly colorSpace: string;
+  /** Frames for which `encoder.encode()` accepted a VideoFrame. */
+  readonly framesSubmitted: number;
+  /** VideoFrames for which `close()` was called after submission. */
+  readonly framesClosed: number;
+  /** `EncodedVideoChunk`s emitted by the encoder so far. */
+  readonly chunksEmitted: number;
+  /** Sum of `EncodedVideoChunk.byteLength` across emitted chunks. */
+  readonly chunkBytes: number;
+  /** Number of emitted chunks with `type === 'key'`. */
+  readonly keyFrames: number;
+  /** Current `VideoEncoder.encodeQueueSize` (encoder backpressure signal). */
+  readonly encodeQueueSize: number;
+  /** Most recent encoder error message, if any. */
+  readonly lastError: string | null;
+}
+
+/**
  * A single decoded HDR frame delivered to the CPU or to a downstream consumer.
  *
  * **Memory note:** a 1280x720 RGBA `Float32Array` frame is ~14.75 MB
@@ -217,6 +297,10 @@ export interface FloatFrame {
   /**
    * Tightly packed, linear Rec. 2020 RGBA pixels as 32-bit floats. Values may
    * exceed `1.0` to represent HDR highlights and are never clamped here.
+   *
+   * When readback uses `reuseOutputBuffer: true`, this array is shared across
+   * frames and is overwritten by the next readback. Consumers must finish with
+   * it (and call `release()`) before awaiting the next frame.
    */
   readonly pixels: Float32Array;
   /**
@@ -225,9 +309,16 @@ export interface FloatFrame {
    */
   readonly bytesPerRow: number;
   /**
+   * Readback-stage timing and staging-ring diagnostics for this frame. Present
+   * for frames produced by `src/gpu/readback.ts`.
+   */
+  readonly readback?: ReadbackTiming;
+  /**
    * Marks the frame as consumed. Idempotent. GPU staging memory is already
    * unmapped and recycled before the frame is returned, so this only signals
    * that the caller is done with the CPU `pixels` payload and may drop it.
+   * When the output buffer is reused, this also releases the shared buffer for
+   * the next readback.
    */
   release(): void;
 }
@@ -277,4 +368,10 @@ export interface TelemetrySnapshot {
   readonly renderFormat?: GPUTextureFormat;
   /** Sampled value statistics for the most recently completed frame. */
   readonly lastFrameValues?: FrameValueStats;
+  /** Stage timing breakdown for the most recently completed frame. */
+  readonly lastFrameTimings?: FrameTimingBreakdown;
+  /** Rolling per-stage averages across all completed frames. */
+  readonly averageFrameTimings?: FrameTimingBreakdown;
+  /** Live optional-encoder telemetry; absent when the tap is disabled. */
+  readonly encoder?: EncoderTelemetry;
 }
