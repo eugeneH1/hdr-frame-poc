@@ -35,8 +35,11 @@
  *   design pixels to WebGPU NDC (`-1..1`, +Y up).
  * - **Shape-local space** has the shape's top-left at `(0, 0)` and extends to
  *   `(width, height)`, so the shape center sits at `(width/2, height/2)`.
- * - Positive rotation is counter-clockwise in mathematical terms (y-up); the
- *   renderer may negate it when converting the y-down design space to NDC.
+ * - Because design space is **+Y down**, a positive rotation turns +X toward +Y,
+ *   i.e. it reads as **clockwise on screen** (matching the Canvas 2D convention).
+ *   Rotation and shear preserve handedness (`det = 1` here), so shapes are never
+ *   mirrored. The `designToClip` Y flip is undone by the WebGPU viewport's
+ *   NDC->framebuffer Y flip, keeping local +Y pointing down on screen.
  *
  * Scale and skew sanity:
  * - Scale is authored strictly positive (no zero crossing, no mirror flips), so
@@ -112,7 +115,8 @@ export function translate(tx: number, ty: number): AffineMatrix {
 /**
  * Builds a rotation matrix.
  *
- * @param radians - Rotation angle in radians (counter-clockwise positive).
+ * @param radians - Rotation angle in radians (clockwise-positive in the y-down
+ *   design space, matching the Canvas 2D convention).
  * @returns Column-major rotation matrix about the origin.
  */
 export function rotate(radians: number): AffineMatrix {

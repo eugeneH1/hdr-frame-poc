@@ -19,7 +19,7 @@
 /** Half-float RGBA: 4 channels of 16-bit floats per pixel. */
 export const BYTES_PER_PIXEL_F16 = 8;
 
-/** Full-float RGBA: 4 channels of 32-bit floats per pixel (CPU-side analysis only). */
+/** Full-float RGBA: 4 channels of 32-bit floats per pixel (CPU frame payload). */
 export const BYTES_PER_PIXEL_F32 = 16;
 
 /**
@@ -106,7 +106,10 @@ export type AffineMatrix = readonly [
 export interface Transform2D {
   /** Translation in design pixels relative to the design-space origin. */
   readonly translation: TransformVec2;
-  /** Rotation in radians (counter-clockwise positive). */
+  /**
+   * Rotation in radians, clockwise-positive in the y-down design space
+   * (matching the Canvas 2D convention).
+   */
   readonly rotation: number;
   /** Non-uniform scale; `[1, 1]` is identity scale. */
   readonly scale: TransformVec2;
@@ -186,9 +189,13 @@ export interface FrameMeta {
   readonly width: number;
   /** Frame height in pixels. */
   readonly height: number;
-  /** Color space the encoded pixels are tagged as (typically Rec. 2100 PQ). */
+  /** Color space the float pixels are expressed in (linear working space). */
   readonly colorSpace: ColorSpaceSpec;
-  /** Pixel format of `FloatFrame.pixels` (`rgba16float` in normal operation). */
+  /**
+   * GPU render-target format the pixels were read back from (`rgba16float` by
+   * default, or `rgba32float` when the device supports it). `FloatFrame.pixels`
+   * is always decoded to 32-bit floats on the CPU.
+   */
   readonly format: GPUTextureFormat;
   /** Wall-clock milliseconds spent producing this frame (filled by the pipeline). */
   readonly renderTimeMs: number;
@@ -197,26 +204,30 @@ export interface FrameMeta {
 /**
  * A single decoded HDR frame delivered to the CPU or to a downstream consumer.
  *
- * **Memory note:** each 1280x720 `rgba16float` frame is ~7.03 MB. Retaining all
- * 300 frames would cost ~2.1 GB, so `FloatFrame.pixels` is intended to be
- * transferred/consumed and released per-frame rather than accumulated.
+ * **Memory note:** a 1280x720 RGBA `Float32Array` frame is ~14.75 MB
+ * (`1280 * 720 * 4 channels * 4 bytes`). Retaining all 300 frames would cost
+ * ~4.4 GB, so `FloatFrame.pixels` is intended to be transferred/consumed and
+ * released per-frame rather than accumulated. Reading back from an
+ * `rgba16float` GPU target halves GPU-side bandwidth, but the CPU-side payload
+ * is still expanded to `Float32Array` for uniform downstream handling.
  */
 export interface FloatFrame {
   /** Frame identity, timing, and format metadata. */
   readonly meta: FrameMeta;
   /**
-   * Pixel payload as a typed array view. `Uint16Array` holds half-float bit
-   * patterns (rgba16float); consumers convert with `float16` helpers as needed.
+   * Tightly packed, linear Rec. 2020 RGBA pixels as 32-bit floats. Values may
+   * exceed `1.0` to represent HDR highlights and are never clamped here.
    */
-  readonly pixels: Uint16Array;
+  readonly pixels: Float32Array;
   /**
-   * Tightly packed row stride in bytes, equal to `width * BYTES_PER_PIXEL_F16`
-   * (i.e. padding from GPU readback has already been stripped).
+   * Tightly packed row stride in bytes, equal to
+   * `width * BYTES_PER_PIXEL_F32` once GPU row padding has been stripped.
    */
   readonly bytesPerRow: number;
   /**
-   * Releases the backing allocation. After calling this, `pixels` must not be
-   * read; the pipeline calls it once the frame has been consumed.
+   * Marks the frame as consumed. Idempotent. GPU staging memory is already
+   * unmapped and recycled before the frame is returned, so this only signals
+   * that the caller is done with the CPU `pixels` payload and may drop it.
    */
   release(): void;
 }
