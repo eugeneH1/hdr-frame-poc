@@ -293,7 +293,8 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     'Frames are streamed: each Float32 frame (~14.75 MB at 1280×720) is released after readback, ' +
       'so a 300-frame run never retains all frames (~4.4 GB if it did). Enable WebCodecs encode ' +
       'to pack each frame as I420P10 (RGBA fallback) and feed a Rec. 2100 PQ/HLG encoder; chunk ' +
-      'counts and bytes are tracked here, with muxing left to a future phase.',
+      'counts and bytes are tracked here, with muxing left to a future phase. 10-bit encoder input ' +
+      'requires the browser to expose I420P10 VideoFrames; otherwise the tap falls back to 8-bit RGBA.',
   );
 
   const warningEl = createElement('p', 'wb-warning');
@@ -324,8 +325,10 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       return;
     }
 
+    const formatLabel =
+      status.frameFormat === 'RGBA' ? 'RGBA (8-bit fallback)' : status.frameFormat;
     encoderStat.value.textContent =
-      `${status.state} · ${status.codec} · ${status.frameFormat} · ${status.colorSpace}`;
+      `${status.state} · ${status.codec} · ${formatLabel} · ${status.colorSpace}`;
     chunksStat.value.textContent =
       `${status.framesSubmitted} sent · ${status.chunksEmitted} chunks · ` +
       `${formatMegabytes(status.chunkBytes)} MB · ${status.keyFrames} key · q${status.encodeQueueSize}`;
@@ -441,8 +444,16 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
             // WebCodecs profiles are tagged Rec.2100 PQ or HLG; linear/unknown
             // output descriptions fall back to PQ for the encoder metadata.
             transfer: config.outputColorSpace.transfer === 'hlg' ? 'hlg' : 'pq',
-            onWarning: (message) => showWarning(`Video encoder: ${message}`),
-            onError: (error) => showWarning(`Video encoder: ${error.message}`),
+            onWarning: (message) => {
+              // Keep the full fallback reason available after the UI warning is
+              // replaced by a later pipeline warning.
+              console.warn(`[hdr-frame-poc] Video encoder: ${message}`);
+              showWarning(`Video encoder: ${message}`);
+            },
+            onError: (error) => {
+              console.error('[hdr-frame-poc] Video encoder:', error);
+              showWarning(`Video encoder: ${error.message}`);
+            },
           },
         );
 

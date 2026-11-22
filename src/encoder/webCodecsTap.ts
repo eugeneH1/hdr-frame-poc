@@ -315,11 +315,19 @@ interface FramePacker {
   init(frame: FloatFrame): HdrVideoFrameInit;
 }
 
-function makeI420P10Packer(
-  width: number,
-  height: number,
-  transfer: 'pq' | 'hlg',
-): FramePacker {
+interface I420P10LayoutInfo {
+  /** Tightly packed plane offsets/strides, in bytes. */
+  readonly layout: PlaneLayout[];
+  /** Total 16-bit samples across all three planes. */
+  readonly totalSamples: number;
+}
+
+/**
+ * Computes the tightly packed I420P10 layout. WebCodecs' default layout for this
+ * format is the same tight packing, so the explicit layout is only needed for
+ * UAs that reject the default (or align it differently).
+ */
+function getI420P10Layout(width: number, height: number): I420P10LayoutInfo {
   const chromaWidth = Math.ceil(width / 2);
   const chromaHeight = Math.ceil(height / 2);
   const lumaSamples = width * height;
@@ -327,8 +335,25 @@ function makeI420P10Packer(
   const totalSamples = lumaSamples + chromaSamples * 2;
   const lumaStride = width * 2;
   const chromaStride = chromaWidth * 2;
-  const uOffset = lumaSamples * 2;
-  const vOffset = (lumaSamples + chromaSamples) * 2;
+
+  return {
+    layout: [
+      { offset: 0, stride: lumaStride },
+      { offset: lumaSamples * 2, stride: chromaStride },
+      { offset: (lumaSamples + chromaSamples) * 2, stride: chromaStride },
+    ],
+    totalSamples,
+  };
+}
+
+function makeI420P10Packer(
+  width: number,
+  height: number,
+  transfer: 'pq' | 'hlg',
+  explicitLayout: boolean,
+): FramePacker {
+  const lumaSamples = width * height;
+  const { layout, totalSamples } = getI420P10Layout(width, height);
   let scratch: Uint16Array | null = null;
 
   return {
@@ -350,11 +375,7 @@ function makeI420P10Packer(
         codedHeight: height,
         timestamp: frame.meta.timestampUs,
         duration: frame.meta.durationUs,
-        layout: [
-          { offset: 0, stride: lumaStride },
-          { offset: uOffset, stride: chromaStride },
-          { offset: vOffset, stride: chromaStride },
-        ],
+        ...(explicitLayout ? { layout } : {}),
         colorSpace: {
           primaries: 'bt2020',
           transfer,
@@ -432,47 +453,113 @@ function buildEncoderConfig(
   };
 }
 
-/** Verifies that the UA can construct a `VideoFrame` with the chosen format. */
-function probeFrameFormat(
-  format: EncoderFrameFormat,
+/** Result of probing whether a VideoFrame format/layout can be constructed. */
+interface FrameProbeResult {
+  readonly ok: boolean;
+  /** True when only an explicit plane layout was accepted. */
+  readonly explicitLayout: boolean;
+  /** Underlying UA error(s), already deduplicated for display. */
+  readonly error: string | null;
+}
+
+function tryI420P10Frame(
+  width: number,
+  height: number,
   transfer: 'pq' | 'hlg',
-): boolean {
+  explicitLayout: boolean,
+): string | null {
   let probe: VideoFrame | null = null;
   try {
-    if (format === 'I420P10') {
-      const data = new Uint16Array(6); // 2x2 Y (4) + 1x1 U + 1x1 V
-      const init: HdrVideoFrameInit = {
-        format: 'I420P10',
-        codedWidth: 2,
-        codedHeight: 2,
-        timestamp: 0,
-        duration: 1,
-        layout: [
-          { offset: 0, stride: 4 },
-          { offset: 8, stride: 2 },
-          { offset: 10, stride: 2 },
-        ],
-        colorSpace: buildColorSpace(transfer, 'bt2020-ncl', false),
-      };
-      probe = new VideoFrame(data, init as unknown as VideoFrameBufferInit);
-    } else {
-      const data = new Uint8Array(16); // 2x2 RGBA
-      const init: HdrVideoFrameInit = {
-        format: 'RGBA',
-        codedWidth: 2,
-        codedHeight: 2,
-        timestamp: 0,
-        duration: 1,
-        colorSpace: buildColorSpace(transfer, 'rgb', true),
-      };
-      probe = new VideoFrame(data, init as unknown as VideoFrameBufferInit);
-    }
-    return true;
-  } catch {
-    return false;
+    const { layout, totalSamples } = getI420P10Layout(width, height);
+    const init: HdrVideoFrameInit = {
+      format: 'I420P10',
+      codedWidth: width,
+      codedHeight: height,
+      timestamp: 0,
+      duration: 1,
+      ...(explicitLayout ? { layout } : {}),
+      colorSpace: buildColorSpace(transfer, 'bt2020-ncl', false),
+    };
+    probe = new VideoFrame(
+      new Uint16Array(totalSamples),
+      init as unknown as VideoFrameBufferInit,
+    );
+    return null;
+  } catch (error) {
+    return describeError(error);
   } finally {
-    probe?.close();
+    try {
+      probe?.close();
+    } catch {
+      // Ignore probe teardown races.
+    }
   }
+}
+
+/**
+ * Probes I420P10 construction at the real frame size, first with an explicit
+ * tight layout and then with the UA's default layout. Probing the actual size
+ * (rather than a 2x2 toy frame) ensures a successful probe means real frames
+ * will construct too.
+ */
+function probeI420P10(
+  width: number,
+  height: number,
+  transfer: 'pq' | 'hlg',
+): FrameProbeResult {
+  const errors = new Set<string>();
+
+  for (const explicitLayout of [true, false]) {
+    const error = tryI420P10Frame(width, height, transfer, explicitLayout);
+    if (!error) {
+      return { ok: true, explicitLayout, error: null };
+    }
+    errors.add(error);
+  }
+
+  return { ok: false, explicitLayout: false, error: [...errors].join('; ') };
+}
+
+function tryRgbaFrame(
+  width: number,
+  height: number,
+  transfer: 'pq' | 'hlg',
+): string | null {
+  let probe: VideoFrame | null = null;
+  try {
+    const init: HdrVideoFrameInit = {
+      format: 'RGBA',
+      codedWidth: width,
+      codedHeight: height,
+      timestamp: 0,
+      duration: 1,
+      colorSpace: buildColorSpace(transfer, 'rgb', true),
+    };
+    probe = new VideoFrame(
+      new Uint8Array(width * height * 4),
+      init as unknown as VideoFrameBufferInit,
+    );
+    return null;
+  } catch (error) {
+    return describeError(error);
+  } finally {
+    try {
+      probe?.close();
+    } catch {
+      // Ignore probe teardown races.
+    }
+  }
+}
+
+function probeRgba(
+  width: number,
+  height: number,
+  transfer: 'pq' | 'hlg',
+): FrameProbeResult {
+  const error = tryRgbaFrame(width, height, transfer);
+  return error
+    ? { ok: false, explicitLayout: false, error }
+    : { ok: true, explicitLayout: false, error: null };
 }
 
 /**
@@ -559,25 +646,41 @@ export async function createVideoEncoderTap(
   const selectedCodec: string = codec;
 
   let frameFormat: EncoderFrameFormat = options.frameFormat ?? 'I420P10';
-  if (!probeFrameFormat(frameFormat, transfer)) {
-    if (frameFormat === 'I420P10') {
-      warn(
-        'I420P10 VideoFrames are unavailable in this UA; falling back to 8-bit RGBA input.',
-      );
-      frameFormat = 'RGBA';
-      if (!probeFrameFormat(frameFormat, transfer)) {
-        warn('This UA cannot construct VideoFrames in any supported format.');
+  let explicitLayout = false;
+
+  if (frameFormat === 'I420P10') {
+    const probe = probeI420P10(width, height, transfer);
+    if (probe.ok) {
+      explicitLayout = probe.explicitLayout;
+    } else {
+      const rgbaProbe = probeRgba(width, height, transfer);
+      if (!rgbaProbe.ok) {
+        warn(
+          `No usable VideoFrame input format in this UA ` +
+            `(I420P10: ${probe.error ?? 'unavailable'}; RGBA: ${rgbaProbe.error ?? 'unavailable'}).`,
+        );
         return null;
       }
-    } else {
-      warn(`VideoFrames in ${frameFormat} format are unavailable in this UA.`);
+      warn(
+        `I420P10 VideoFrames are unavailable in this UA (${probe.error ?? 'unsupported'}); ` +
+          'falling back to 8-bit RGBA input. HDR precision is reduced, but the encoder config ' +
+          'still carries Rec.2020 PQ/HLG metadata.',
+      );
+      frameFormat = 'RGBA';
+    }
+  } else {
+    const rgbaProbe = probeRgba(width, height, transfer);
+    if (!rgbaProbe.ok) {
+      warn(
+        `RGBA VideoFrames are unavailable in this UA (${rgbaProbe.error ?? 'unsupported'}).`,
+      );
       return null;
     }
   }
 
   const packer =
     frameFormat === 'I420P10'
-      ? makeI420P10Packer(width, height, transfer)
+      ? makeI420P10Packer(width, height, transfer, explicitLayout)
       : makeRgbaPacker(width, height, transfer);
   const keyFrameInterval = Math.max(
     0,
