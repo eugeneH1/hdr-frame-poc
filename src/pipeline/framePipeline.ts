@@ -682,6 +682,11 @@ export async function runFramePipeline(
     detachDeviceLost = context.onDeviceLost((reason) => {
       deviceLostReason = reason;
       addWarning(`GPU device lost: ${reason}`);
+      // Unblock any in-flight readback whose `mapAsync` may never resolve after
+      // device loss. The readback manager races every map against an internal
+      // rejection promise; `signalDeviceLost` fires that rejection immediately
+      // and also rejects pending staging-buffer waiters.
+      readbackManager?.signalDeviceLost(reason);
     });
 
     if (typeof document !== 'undefined') {

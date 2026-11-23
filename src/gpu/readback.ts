@@ -97,6 +97,19 @@ export interface ReadbackManager {
   readonly reuseOutputBuffer: boolean;
   /** Staging buffers currently owned by a copy/map job (for diagnostics). */
   readonly activeReadbacks: number;
+  /**
+   * Signals that the GPU device has been lost mid-run.
+   *
+   * Immediately rejects all pending staging-buffer waiters and races any
+   * in-flight `mapAsync` calls against an internal rejection so they cannot
+   * hang indefinitely. Staging buffers are also destroyed, which causes pending
+   * maps to reject on implementations that honour it. Idempotent; subsequent
+   * calls are no-ops.
+   *
+   * This should be called from the pipeline's `onDeviceLost` callback so that
+   * the frame loop sees a prompt rejection rather than a silent stall.
+   */
+  signalDeviceLost(reason: string): void;
   /** Destroys staging buffers and rejects any queued acquisitions. Idempotent. */
   dispose(): void;
 }
@@ -256,6 +269,19 @@ export function createReadbackManager(
   const waiters: Waiter[] = [];
   let disposed = false;
   let reuseReserved = false;
+
+  // --- Device-lost signalling ------------------------------------------------
+  // A promise that rejects when `signalDeviceLost` is called. `complete()`
+  // races `mapAsync` against it so a map that will never resolve is unblocked
+  // promptly instead of stalling the pipeline indefinitely.
+  let deviceLostError: Error | null = null;
+  let rejectDeviceLost!: (reason: unknown) => void;
+  const deviceLostPromise = new Promise<never>((_, reject) => {
+    rejectDeviceLost = reject;
+  });
+  // Suppress the unhandled-rejection warning that fires when no readback has
+  // yet raced against this promise when the device is lost (e.g. during init).
+  void deviceLostPromise.catch(() => {});
   // Allocate the shared payload up front so reuse mode performs no large
   // allocations during the run and telemetry's retained-bytes value is exact.
   const sharedOutput: Float32Array | null = reuseOutputBuffer
@@ -438,7 +464,16 @@ export function createReadbackManager(
     let unpackMs = 0;
 
     try {
-      await copy.mapped;
+      // Race the GPU map against the device-lost signal. If the device is lost,
+      // `deviceLostPromise` rejects first and we surface a clear error instead
+      // of hanging until the page is closed. If `copy.mapped` resolves first
+      // but device loss was also signalled concurrently, the post-race guard
+      // below catches that case so we never attempt `getMappedRange` on a
+      // potentially invalid buffer.
+      await Promise.race([copy.mapped, deviceLostPromise]);
+      if (deviceLostError) {
+        throw deviceLostError;
+      }
       const mappedAt = performance.now();
       waitMs = mappedAt - copy.mapStartedAt;
 
@@ -534,6 +569,37 @@ export function createReadbackManager(
         if (slot.inUse) active++;
       }
       return active;
+    },
+
+    signalDeviceLost(reason: string): void {
+      if (deviceLostError) return;
+      deviceLostError = new Error(`gpu.readback: GPU device lost: ${reason}`);
+
+      logError('readback', 'Device lost; aborting all pending and in-flight readbacks', undefined, {
+        reason,
+        waiters: waiters.length,
+        activeReadbacks: manager.activeReadbacks,
+      });
+
+      // Reject any callers waiting for a free staging buffer.
+      for (const waiter of waiters.splice(0)) {
+        waiter.reject(deviceLostError);
+      }
+
+      // Destroy staging buffers. On implementations that honour it, destroying
+      // a buffer whose `mapAsync` is pending causes the map promise to reject,
+      // which unblocks `complete()` immediately. The race in `complete()` also
+      // catches this even on implementations that silently drop the map.
+      for (const slot of slots) {
+        try {
+          slot.buffer.destroy();
+        } catch {
+          // A buffer in a lost device is already invalid; ignore teardown errors.
+        }
+      }
+
+      // Fire the rejection so any `complete()` awaiting the race is unblocked.
+      rejectDeviceLost(deviceLostError);
     },
 
     dispose(): void {

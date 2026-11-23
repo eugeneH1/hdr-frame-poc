@@ -103,8 +103,9 @@ section will be expanded into the final README.
   formats in current browsers, so true 10-bit input is unavailable without a
   WASM/native encoder (or externally decoded 10-bit frames).
 - WebGPU requires a secure context and a supported browser/OS. Device loss,
-  adapter loss, and uncaptured validation/OOM errors are handled as diagnostics;
-  a lost device can still leave an in-flight readback waiting.
+  adapter loss, and uncaptured validation/OOM errors are handled as diagnostics.
+  On device loss, `signalDeviceLost` promptly unblocks all in-flight readbacks
+  and rejects pending buffer waiters rather than leaving operations stalled.
 - `rgba32float` is only usable with the optional renderable/blendable features;
   the context falls back to `rgba16float` otherwise.
 - WebCodecs codec availability varies by OS/browser/hardware (HEVC, AV1, VP9
@@ -169,7 +170,7 @@ section will be expanded into the final README.
 - [ ] Add a Rec. 2020 -> Rec. 709 gamut matrix to the SDR preview (and document
   the tone curve).
 - [x] Apply encoder back-pressure instead of only warning about queue depth.
-- [ ] Fail the run promptly on GPU device loss and reject in-flight readbacks.
+- [x] Fail the run promptly on GPU device loss and reject in-flight readbacks.
 - [ ] Render text (Canvas 2D/SDF source, linearized and scaled into HDR range).
 - [ ] Investigate/present HDR output accurately where the browser supports it.
 - [ ] Write the final README (this draft is the source material).
