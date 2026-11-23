@@ -19,6 +19,7 @@
  */
 
 import type { RenderConfig } from '../types/frame.ts';
+import { logDebug, logError, logInfo, logWarn } from '../diagnostics/logger.ts';
 
 /** Result of a successful WebGPU initialization. */
 export interface GpuContext {
@@ -56,6 +57,34 @@ const contextState = new WeakMap<GpuContext, ContextState>();
 const FEATURE_FLOAT32_RENDERABLE = 'float32-renderable' as GPUFeatureName;
 const FEATURE_FLOAT32_BLENDABLE = 'float32-blendable' as GPUFeatureName;
 
+/** Structural view of `GPUAdapterInfo`; older DOM typings omit the `info` field. */
+interface AdapterInfoLike {
+  readonly vendor?: string;
+  readonly architecture?: string;
+  readonly device?: string;
+  readonly description?: string;
+}
+
+/** Structural view of a `GPUError` raised as an `uncapturederror` event. */
+interface GpuErrorLike {
+  readonly type?: string;
+  readonly message?: string;
+}
+
+function describeAdapter(adapter: GPUAdapter): Record<string, unknown> {
+  const info = (adapter as unknown as { info?: AdapterInfoLike }).info;
+  return {
+    vendor: info?.vendor ?? 'unknown',
+    architecture: info?.architecture ?? 'unknown',
+    device: info?.device ?? 'unknown',
+    description: info?.description ?? 'unknown',
+    features: Array.from(adapter.features),
+    maxBufferSize: adapter.limits.maxBufferSize,
+    maxTextureDimension2D: adapter.limits.maxTextureDimension2D,
+    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+  };
+}
+
 /**
  * Initializes WebGPU for the POC.
  *
@@ -86,6 +115,8 @@ export async function initGpuContext(config: RenderConfig): Promise<GpuContext> 
     throw new Error('gpu.context.initGpuContext: no suitable GPUAdapter was found');
   }
 
+  logInfo('gpu', 'Adapter acquired', describeAdapter(adapter));
+
   const supportedFeatures = new Set<string>(Array.from(adapter.features));
   const requiredFeatures: GPUFeatureName[] = [];
   let renderFormat: GPUTextureFormat = 'rgba16float';
@@ -96,8 +127,13 @@ export async function initGpuContext(config: RenderConfig): Promise<GpuContext> 
     if (canRender32 && canBlend32) {
       renderFormat = 'rgba32float';
       requiredFeatures.push(FEATURE_FLOAT32_RENDERABLE, FEATURE_FLOAT32_BLENDABLE);
+    } else {
+      // Otherwise fall through to rgba16float (core-renderable and blendable).
+      logWarn('gpu', 'Requested rgba32float is not fully supported; using rgba16float', {
+        float32Renderable: canRender32,
+        float32Blendable: canBlend32,
+      });
     }
-    // Otherwise fall through to rgba16float (core-renderable and blendable).
   } else if (config.renderFormat === 'rgba16float') {
     renderFormat = 'rgba16float';
   } else {
@@ -110,7 +146,14 @@ export async function initGpuContext(config: RenderConfig): Promise<GpuContext> 
   try {
     device = await adapter.requestDevice({ requiredFeatures });
   } catch (error) {
-    if (renderFormat === 'rgba16float') throw error;
+    if (renderFormat === 'rgba16float') {
+      logError('gpu', 'requestDevice failed', error, { requiredFeatures });
+      throw error;
+    }
+    logWarn('gpu', 'requestDevice with rgba32float features failed; falling back to rgba16float', {
+      error: error instanceof Error ? error.message : String(error),
+      requiredFeatures,
+    });
     // Feature request or format validation failed; retry with the universally
     // supported HDR format rather than failing the whole run.
     renderFormat = 'rgba16float';
@@ -119,9 +162,36 @@ export async function initGpuContext(config: RenderConfig): Promise<GpuContext> 
 
   const lossHandlers = new Set<(reason: string) => void>();
 
+  // WebGPU validation/OOM failures are reported as events rather than thrown
+  // exceptions. Without this listener they only appear in the browser's own
+  // console formatting, which makes a stalling run look error-free.
+  device.addEventListener('uncapturederror', (event) => {
+    const gpuError = (event as unknown as { error?: GpuErrorLike }).error;
+    logError('gpu', 'Uncaptured WebGPU error', gpuError, {
+      type: gpuError?.type ?? 'unknown',
+      message: gpuError?.message ?? '(no message)',
+    });
+  });
+
   // Surface unexpected device loss to subscribers. `destroyGpuContext` clears
   // the set first, so a deliberate destroy does not notify handlers.
   void device.lost.then((info) => {
+    const state = contextState.get(context);
+    const expected = state === undefined || state.destroyed;
+    const lossDetails = {
+      reason: info.reason,
+      message: info.message || '(none)',
+    };
+
+    if (expected) {
+      logDebug('gpu', 'GPU device destroyed', lossDetails);
+      return;
+    }
+
+    // A lost device stops making progress but does not reject every in-flight
+    // operation on all implementations, so make the cause explicit.
+    logError('gpu', `GPU device lost (${info.reason})`, undefined, lossDetails);
+
     const reason = info.message || info.reason;
     for (const handler of lossHandlers) {
       try {
@@ -148,6 +218,12 @@ export async function initGpuContext(config: RenderConfig): Promise<GpuContext> 
   };
 
   contextState.set(context, { device, lossHandlers, destroyed: false });
+  logInfo('gpu', 'WebGPU device ready', {
+    requestedFormat: config.renderFormat,
+    renderFormat,
+    requiredFeatures,
+    preferredCanvasFormat: context.preferredFormat,
+  });
   return context;
 }
 
@@ -166,6 +242,7 @@ export function destroyGpuContext(context: GpuContext): void {
 
   state.destroyed = true;
   state.lossHandlers.clear();
+  logDebug('gpu', 'Destroying GPU device');
   state.device.destroy();
   contextState.delete(context);
 }

@@ -27,6 +27,7 @@ import { getWorkingColorSpace } from '../timeline/sceneAnimator.ts';
 import { runFramePipeline } from '../pipeline/framePipeline.ts';
 import { createVideoEncoderTap, flushAndClose } from '../encoder/webCodecsTap.ts';
 import type { VideoEncoderTap } from '../encoder/webCodecsTap.ts';
+import { describeLogging, logDebug, logError, logInfo, logWarn } from '../diagnostics/logger.ts';
 
 const DEFAULT_WIDTH = 1280;
 const DEFAULT_HEIGHT = 720;
@@ -171,7 +172,10 @@ async function detectFloat32RenderTargetSupport(): Promise<boolean> {
       adapter.features.has('float32-renderable' as GPUFeatureName) &&
       adapter.features.has('float32-blendable' as GPUFeatureName)
     );
-  } catch {
+  } catch (error) {
+    logDebug('workbench', 'rgba32float capability probe failed', {
+      error: describeError(error),
+    });
     return false;
   }
 }
@@ -396,7 +400,9 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     if (running || unmounted) return;
 
     if (!webgpuAvailable) {
-      showWarning('WebGPU is not available in this browser; cannot start a run.');
+      const message = 'WebGPU is not available in this browser; cannot start a run.';
+      logWarn('workbench', message);
+      showWarning(message);
       setState('error', 'Unsupported');
       return;
     }
@@ -411,6 +417,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
 
     const controller = new AbortController();
     activeController = controller;
+    const runStart = performance.now();
 
     const selection: WorkbenchRunOptions = {
       width: DEFAULT_WIDTH,
@@ -421,6 +428,17 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     };
     const config = createConfig(selection);
     const wantEncoder = encoderToggle.checked && webCodecsAvailable;
+
+    logInfo('workbench', 'Starting run', {
+      width: config.width,
+      height: config.height,
+      fps: config.fps,
+      frameCount: config.frameCount,
+      renderFormat: config.renderFormat,
+      encoderRequested: wantEncoder,
+      webCodecsAvailable,
+      logging: describeLogging(),
+    });
 
     // The preview swap chain is sized from the canvas drawing buffer, so it must
     // be set before the pipeline creates the preview renderer.
@@ -435,31 +453,59 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
 
     try {
       if (wantEncoder) {
-        encoderTap = await createVideoEncoderTap(
-          createEncoderProbeMeta(config),
-          () => {
-            // Chunk data is intentionally dropped: muxing is out of scope.
-          },
-          {
-            // WebCodecs profiles are tagged Rec.2100 PQ or HLG; linear/unknown
-            // output descriptions fall back to PQ for the encoder metadata.
-            transfer: config.outputColorSpace.transfer === 'hlg' ? 'hlg' : 'pq',
-            onWarning: (message) => {
-              // Keep the full fallback reason available after the UI warning is
-              // replaced by a later pipeline warning.
-              console.warn(`[hdr-frame-poc] Video encoder: ${message}`);
-              showWarning(`Video encoder: ${message}`);
+        logInfo('workbench', 'Creating VideoEncoder tap', {
+          width: config.width,
+          height: config.height,
+          fps: config.fps,
+          transfer: config.outputColorSpace.transfer,
+        });
+        const encoderWatchdog = setInterval(() => {
+          logWarn('workbench', 'VideoEncoder creation has not completed yet', {
+            waitingMs: Math.round(performance.now() - runStart),
+            pageVisibility:
+              typeof document !== 'undefined' ? document.visibilityState : 'unknown',
+          });
+        }, 5000);
+        try {
+          encoderTap = await createVideoEncoderTap(
+            createEncoderProbeMeta(config),
+            () => {
+              // Chunk data is intentionally dropped: muxing is out of scope.
             },
-            onError: (error) => {
-              console.error('[hdr-frame-poc] Video encoder:', error);
-              showWarning(`Video encoder: ${error.message}`);
+            {
+              // WebCodecs profiles are tagged Rec.2100 PQ or HLG; linear/unknown
+              // output descriptions fall back to PQ for the encoder metadata.
+              transfer: config.outputColorSpace.transfer === 'hlg' ? 'hlg' : 'pq',
+              onWarning: (message) => {
+                // The encoder tap already logs to the console; keep the fallback
+                // reason available in the UI after later warnings replace it.
+                showWarning(`Video encoder: ${message}`);
+              },
+              onError: (error) => {
+                showWarning(`Video encoder: ${error.message}`);
+              },
             },
-          },
+          );
+        } finally {
+          clearInterval(encoderWatchdog);
+        }
+
+        logInfo(
+          'workbench',
+          encoderTap ? 'VideoEncoder tap ready' : 'VideoEncoder tap unavailable',
+          encoderTap
+            ? {
+                codec: encoderTap.codec,
+                frameFormat: encoderTap.frameFormat,
+                state: encoderTap.status().state,
+              }
+            : undefined,
         );
 
         if (!encoderTap) {
           // `createVideoEncoderTap` reports the specific reason through
           // `onWarning`; only add a fallback when it was silent.
+          logInfo('workbench', 'Continuing without a VideoEncoder tap');
           if (warningEl.hidden) {
             showWarning(
               'No supported 10-bit HDR VideoEncoder profile; continuing without encoding.',
@@ -482,7 +528,33 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
 
       updateTelemetry(summary.telemetry);
       setState(summary.cancelled ? 'cancelled' : 'done', summary.cancelled ? 'Cancelled' : 'Complete');
+
+      logInfo('workbench', summary.cancelled ? 'Run cancelled' : 'Run complete', {
+        framesCompleted: summary.framesCompleted,
+        framesTotal: config.frameCount,
+        elapsedMs: Math.round(summary.elapsedMs),
+        measuredFps: Number(summary.telemetry.measuredFps.toFixed(2)),
+        warnings: summary.telemetry.warnings,
+        encoder: summary.telemetry.encoder,
+      });
+
+      if (!summary.cancelled && summary.framesCompleted < config.frameCount) {
+        const message =
+          `Run ended after ${summary.framesCompleted}/${config.frameCount} frames ` +
+          'without reporting an error. Check the console for the last frame and any GPU ' +
+          'device-lost/uncaptured errors.';
+        logWarn('workbench', message, {
+          lastFrameIndex: summary.telemetry.lastFrameIndex,
+          elapsedMs: Math.round(summary.elapsedMs),
+          warnings: summary.telemetry.warnings,
+        });
+        showWarning(message);
+      }
     } catch (error) {
+      logError('workbench', 'Run failed', error, {
+        framesRequested: config.frameCount,
+        elapsedMs: Math.round(performance.now() - runStart),
+      });
       setState('error', 'Error');
       showWarning(`Run failed: ${describeError(error)}`);
     } finally {
@@ -504,6 +576,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
 
   function cancel(): void {
     if (!activeController || activeController.signal.aborted) return;
+    logInfo('workbench', 'Cancel requested');
     activeController.abort();
     setState('cancelling', 'Cancelling');
     cancelButton.disabled = true;
@@ -512,6 +585,9 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   function unmount(): void {
     if (unmounted) return;
     unmounted = true;
+    if (activeController) {
+      logInfo('workbench', 'Unmounting during an active run; aborting it');
+    }
     activeController?.abort();
     activeController = null;
     startButton.removeEventListener('click', onStartClick);

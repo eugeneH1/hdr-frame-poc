@@ -1,5 +1,6 @@
 import './style.css';
 import { mountWorkbench } from './ui/workbench.ts';
+import { logInfo } from './diagnostics/logger.ts';
 
 /**
  * Application entry point.
@@ -16,11 +17,13 @@ if (!root) {
 }
 
 const workbench = mountWorkbench({ root });
+logInfo('app', 'Workbench mounted');
 
 // Tear down the active run and DOM on Vite HMR updates so a reload cannot leave
 // an AbortController or GPU device alive behind a detached workbench.
 if (import.meta.hot) {
   import.meta.hot.dispose(() => {
+    logInfo('app', 'HMR dispose: unmounting workbench');
     workbench.unmount();
   });
 }

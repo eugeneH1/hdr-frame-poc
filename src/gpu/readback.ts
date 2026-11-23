@@ -41,6 +41,7 @@ import type { HdrRenderer } from './hdrRenderer.ts';
 import type { FloatFrame, FrameMeta, ReadbackTiming, RenderConfig } from '../types/frame.ts';
 import { BYTES_PER_PIXEL_F32 } from '../types/frame.ts';
 import { GpuBufferUsage, GpuMapMode } from './webgpuFlags.ts';
+import { logDebug, logError, logInfo } from '../diagnostics/logger.ts';
 
 /** Default number of staging buffers kept in the ring. */
 const DEFAULT_STAGING_BUFFER_COUNT = 3;
@@ -282,6 +283,11 @@ export function createReadbackManager(
     const free = takeFreeSlot();
     if (free) return Promise.resolve(free);
 
+    logDebug('readback', 'Waiting for a free staging buffer', {
+      stagingBufferCount,
+      waiters: waiters.length + 1,
+    });
+
     return new Promise<StagingSlot>((resolve, reject) => {
       let cleanedUp = false;
       const cleanup = (): void => {
@@ -343,6 +349,9 @@ export function createReadbackManager(
     const waiter = waiters.shift();
     if (waiter) {
       // Ownership transfers directly; the slot remains `inUse`.
+      logDebug('readback', `Staging buffer ${slot.index} handed to a waiter`, {
+        remainingWaiters: waiters.length,
+      });
       waiter.resolve(slot);
     } else {
       slot.inUse = false;
@@ -446,6 +455,19 @@ export function createReadbackManager(
       }
       unpackMs = performance.now() - mappedAt;
     } catch (error) {
+      if (isDiscarded()) {
+        logDebug('readback', `frame ${frameIndex} discarded during cancellation`, {
+          stagingBufferIndex: slot.index,
+          waitMs: Number(waitMs.toFixed(2)),
+        });
+      } else {
+        logError('readback', `Readback of frame ${frameIndex} failed`, error, {
+          stagingBufferIndex: slot.index,
+          waitMs: Number(waitMs.toFixed(2)),
+          mapState: slot.buffer.mapState,
+          reuseOutputBuffer,
+        });
+      }
       releaseOutput();
       throw error;
     } finally {
@@ -519,6 +541,12 @@ export function createReadbackManager(
       disposed = true;
       reuseReserved = false;
 
+      logInfo('readback', 'Disposing staging ring', {
+        stagingBufferCount,
+        waiters: waiters.length,
+        activeReadbacks: manager.activeReadbacks,
+      });
+
       for (const waiter of waiters.splice(0)) {
         waiter.reject(
           new Error('gpu.readback: manager disposed while waiting for a staging buffer'),
@@ -546,6 +574,16 @@ export function createReadbackManager(
     releaseOutput,
     submitCopy,
     complete,
+  });
+  logInfo('readback', 'Staging ring created', {
+    format,
+    width,
+    height,
+    bytesPerPixel,
+    paddedBytesPerRow,
+    bufferSize,
+    stagingBufferCount,
+    reuseOutputBuffer,
   });
   return manager;
 }
@@ -624,6 +662,9 @@ export async function readFrameFloats(
   try {
     copy = internals.submitCopy(slot, source);
   } catch (error) {
+    logError('readback', `frame ${frameIndex} copy submission failed`, error, {
+      stagingBufferIndex: slot.index,
+    });
     internals.release(slot);
     internals.releaseOutput();
     throw error;
@@ -673,6 +714,9 @@ export function beginFrameReadback(
   try {
     copy = internals.submitCopy(slot, source);
   } catch (error) {
+    logError('readback', `frame ${frameIndex} copy submission failed`, error, {
+      stagingBufferIndex: slot.index,
+    });
     internals.release(slot);
     internals.releaseOutput();
     throw error;
@@ -708,6 +752,9 @@ export function beginFrameReadback(
   function cancel(): void {
     if (settled) return;
     discarded = true;
+    logDebug('readback', `frame ${frameIndex} readback cancelled`, {
+      stagingBufferIndex: slot.index,
+    });
     // The GPU copy is already queued, so the buffer can only be recycled after
     // a map completes. Drain it and discard the decoded pixels.
     void finish().catch(() => {

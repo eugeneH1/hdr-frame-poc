@@ -50,6 +50,7 @@ import type {
   TelemetrySnapshot,
 } from '../types/frame.ts';
 import { BYTES_PER_PIXEL_F32 } from '../types/frame.ts';
+import { describeLogging, logDebug, logError, logInfo, logWarn } from '../diagnostics/logger.ts';
 
 /** Minimum wall-clock gap between throttled telemetry callbacks. */
 const TELEMETRY_INTERVAL_MS = 100;
@@ -61,6 +62,12 @@ const FPS_WINDOW_SIZE = 30;
 const MAX_WARNINGS = 5;
 /** Default readback lookahead: one GPU copy overlapping one CPU unpack. */
 const DEFAULT_MAX_FRAMES_IN_FLIGHT = 2;
+/** How often an await that should be quick logs its diagnostic state. */
+const STALL_LOG_INTERVAL_MS = 5000;
+/** Encoder queue depth at which the pipeline reports encoding back-pressure. */
+const ENCODER_QUEUE_WARN_THRESHOLD = 16;
+/** Minimum gap between encoder back-pressure warnings. */
+const ENCODER_QUEUE_WARN_INTERVAL_MS = 2000;
 
 /** Metadata reported when a run starts. */
 export interface PipelineStartInfo {
@@ -229,6 +236,15 @@ export async function runFramePipeline(
   const encoder = options.encoderTap ?? null;
   const runStart = performance.now();
 
+  let encoderCodec = 'off';
+  if (encoder) {
+    try {
+      encoderCodec = encoder.status().codec;
+    } catch {
+      encoderCodec = 'unavailable';
+    }
+  }
+
   const warnings: string[] = [];
   const completionTimes: number[] = [];
   const pending: PendingReadback[] = [];
@@ -246,6 +262,12 @@ export async function runFramePipeline(
   let cancelled = false;
   let encoderFlushed = false;
   let encoderWarningIssued = false;
+  let deviceLostReason: string | null = null;
+  let lastEncoderQueueWarningAt = Number.NEGATIVE_INFINITY;
+  /** Exact pipeline step for failure/stall reports. */
+  let currentStage = 'startup';
+  /** Frame being produced (may be ahead of `lastFrameIndex` while in flight). */
+  let currentFrameIndex = -1;
 
   let lastFrameTimings: FrameTimingBreakdown | undefined;
   let averageFrameTimings: FrameTimingBreakdown | undefined;
@@ -259,6 +281,9 @@ export async function runFramePipeline(
   };
 
   function addWarning(message: string): void {
+    // Console first: the UI only shows the latest warning and telemetry keeps
+    // at most MAX_WARNINGS, so a console line is the only durable record.
+    logWarn('pipeline', message);
     warnings.push(message);
     if (warnings.length > MAX_WARNINGS) warnings.shift();
     callbacks?.onWarning?.(message);
@@ -293,7 +318,21 @@ export async function runFramePipeline(
     callbacks?.onTelemetry?.(buildTelemetry());
   }
 
+  logInfo('pipeline', 'Run requested', {
+    width: config.width,
+    height: config.height,
+    fps: config.fps,
+    frameCount: config.frameCount,
+    requestedFormat: config.renderFormat,
+    preview: Boolean(options.previewCanvas),
+    encoder: encoderCodec,
+    maxFramesInFlight:
+      options.readback?.maxFramesInFlight ?? DEFAULT_MAX_FRAMES_IN_FLIGHT,
+    logging: describeLogging(),
+  });
+
   if (signal?.aborted) {
+    logInfo('pipeline', 'Abort signal was already aborted; no frames will be produced');
     await flushAndClose(encoder);
     encoderFlushed = true;
     return {
@@ -305,11 +344,28 @@ export async function runFramePipeline(
   }
 
   let context: GpuContext;
+  currentStage = 'gpu-init';
+  logInfo('pipeline', 'Initializing WebGPU', {
+    requestedFormat: config.renderFormat,
+  });
+  const initWatchdog = setInterval(() => {
+    logWarn('pipeline', 'GPU initialization has not completed yet', {
+      waitingMs: Math.round(performance.now() - runStart),
+      requestedFormat: config.renderFormat,
+      pageVisibility:
+        typeof document !== 'undefined' ? document.visibilityState : 'unknown',
+    });
+  }, STALL_LOG_INTERVAL_MS);
   try {
     context = await initGpuContext(config);
   } catch (error) {
+    logError('pipeline', 'GPU context initialization failed', error, {
+      requestedFormat: config.renderFormat,
+    });
     await flushAndClose(encoder);
     throw error;
+  } finally {
+    clearInterval(initWatchdog);
   }
   renderFormat = context.renderFormat;
 
@@ -317,6 +373,49 @@ export async function runFramePipeline(
   let readbackManager: ReadbackManager | null = null;
   let preview: PreviewRenderer | null = null;
   let detachDeviceLost: (() => void) | null = null;
+  let detachVisibility: (() => void) | null = null;
+
+  function encoderQueueSize(): number | undefined {
+    if (!encoder) return undefined;
+    try {
+      return encoder.encodeQueueSize();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Awaits `work`, logging the pipeline's state every few seconds until it
+   * settles. Readback maps and encoder flushes can stall indefinitely after a
+   * device loss; without this, a hung run looks identical to a slow one and
+   * produces no diagnostics at all.
+   */
+  async function watchForStall<T>(work: Promise<T>, label: string): Promise<T> {
+    const waitStartedAt = performance.now();
+    const timer = setInterval(() => {
+      logWarn('pipeline', `${label} has not settled yet`, {
+        stage: currentStage,
+        currentFrameIndex,
+        waitingMs: Math.round(performance.now() - waitStartedAt),
+        framesCompleted,
+        framesTotal: config.frameCount,
+        lastFrameIndex,
+        pendingReadbacks: pending.length,
+        activeReadbacks: readbackManager?.activeReadbacks,
+        deviceLost: deviceLostReason ?? 'no',
+        pageVisibility:
+          typeof document !== 'undefined' ? document.visibilityState : 'unknown',
+        encoderQueueSize: encoderQueueSize() ?? 'n/a',
+        runElapsedMs: Math.round(performance.now() - runStart),
+      });
+    }, STALL_LOG_INTERVAL_MS);
+
+    try {
+      return await work;
+    } finally {
+      clearInterval(timer);
+    }
+  }
 
   function recordTimings(breakdown: FrameTimingBreakdown): void {
     lastFrameTimings = breakdown;
@@ -349,8 +448,20 @@ export async function runFramePipeline(
       throw new Error('pipeline: readback manager is not initialized');
     }
 
-    const rawFrame = await item.job.finish();
+    logDebug('pipeline', `frame ${item.frameIndex} waiting for readback`, {
+      stagingBufferIndex: item.job.stagingBufferIndex,
+      renderMs: Number(item.renderMs.toFixed(2)),
+      previewMs: Number(item.previewMs.toFixed(2)),
+      activeReadbacks: manager.activeReadbacks,
+      pendingReadbacks: pending.length,
+    });
+
+    const rawFrame = await watchForStall(
+      item.job.finish(),
+      `readback for frame ${item.frameIndex}`,
+    );
     try {
+      currentStage = `frame ${item.frameIndex} pixel-stats`;
       const readback = rawFrame.readback;
       const readbackMs = readback?.waitMs ?? 0;
       const unpackMs = readback?.unpackMs ?? 0;
@@ -383,6 +494,7 @@ export async function runFramePipeline(
 
       let encodeMs = 0;
       if (encoder) {
+        currentStage = `frame ${item.frameIndex} encode`;
         const encodeStart = performance.now();
         const accepted = encodeFrame(encoder, frameForEncode, item.frameIndex === 0);
         encodeMs = performance.now() - encodeStart;
@@ -399,6 +511,22 @@ export async function runFramePipeline(
             `VideoEncoder tap skipped frame ${item.frameIndex}: ${lastError ?? 'encoder is closed or errored'}`,
           );
         }
+
+        const queueSize = encoderQueueSize();
+        if (
+          queueSize !== undefined &&
+          queueSize >= ENCODER_QUEUE_WARN_THRESHOLD &&
+          performance.now() - lastEncoderQueueWarningAt >=
+            ENCODER_QUEUE_WARN_INTERVAL_MS
+        ) {
+          lastEncoderQueueWarningAt = performance.now();
+          logWarn('pipeline', 'VideoEncoder queue is backing up', {
+            frameIndex: item.frameIndex,
+            encodeQueueSize: queueSize,
+            encodeMs: Number(encodeMs.toFixed(2)),
+            framesCompleted,
+          });
+        }
       }
 
       const productionMs =
@@ -414,7 +542,14 @@ export async function runFramePipeline(
       let consumerMs = 0;
       const consumerStart = performance.now();
       try {
-        await callbacks?.onFrame?.(delivered);
+        currentStage = `frame ${item.frameIndex} onFrame`;
+        const pendingConsumer = callbacks?.onFrame?.(delivered);
+        if (pendingConsumer) {
+          await watchForStall(
+            pendingConsumer,
+            `onFrame consumer for frame ${item.frameIndex}`,
+          );
+        }
       } finally {
         consumerMs = performance.now() - consumerStart;
         // Release even if the consumer throws or cancellation arrives during the
@@ -436,6 +571,24 @@ export async function runFramePipeline(
         totalMs,
       });
 
+      logDebug(
+        'pipeline',
+        `frame ${item.frameIndex} delivered (${framesCompleted}/${config.frameCount})`,
+        {
+          stagingBufferIndex: readback?.stagingBufferIndex,
+          mapWaitMs: Number(readbackMs.toFixed(2)),
+          unpackMs: Number(unpackMs.toFixed(2)),
+          encodeMs: Number(encodeMs.toFixed(2)),
+          consumerMs: Number(consumerMs.toFixed(2)),
+          totalMs: Number(totalMs.toFixed(2)),
+          measuredFps: Number(measuredFps.toFixed(2)),
+          encoderQueueSize: encoderQueueSize() ?? 'n/a',
+          pendingReadbacks: pending.length,
+          deviceLost: deviceLostReason ?? 'no',
+        },
+      );
+
+      currentStage = `frame ${item.frameIndex} telemetry`;
       emitTelemetry(item.frameIndex === 0);
     } finally {
       // Safety net for unexpected failures before `delivered.release()` is
@@ -445,15 +598,33 @@ export async function runFramePipeline(
   }
 
   try {
+    currentStage = 'device-lost-subscription';
     detachDeviceLost = context.onDeviceLost((reason) => {
+      deviceLostReason = reason;
       addWarning(`GPU device lost: ${reason}`);
     });
 
+    if (typeof document !== 'undefined') {
+      const onVisibilityChange = (): void => {
+        logInfo('pipeline', `Page visibility changed to "${document.visibilityState}"`, {
+          framesCompleted,
+          lastFrameIndex,
+          pendingReadbacks: pending.length,
+          runElapsedMs: Math.round(performance.now() - runStart),
+        });
+      };
+      document.addEventListener('visibilitychange', onVisibilityChange);
+      detachVisibility = () =>
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+    }
+
     // Keep non-null locals for the hot loop while still assigning to the
     // nullable handles that the `finally` block disposes on every exit path.
+    currentStage = 'renderer-init';
     const hdrRenderer = createHdrRenderer(context, config);
     renderer = hdrRenderer;
 
+    currentStage = 'readback-manager';
     const manager = createReadbackManager(context, config, options.readback);
     readbackManager = manager;
 
@@ -469,9 +640,24 @@ export async function runFramePipeline(
       ? config.width * config.height * BYTES_PER_PIXEL_F32
       : 0;
 
+    logInfo('pipeline', 'Resources ready', {
+      renderFormat,
+      stagingBufferCount: manager.stagingBufferCount,
+      maxFramesInFlight,
+      reuseOutputBuffer: manager.reuseOutputBuffer,
+      bufferMiB: Number((manager.bufferSize / (1024 * 1024)).toFixed(2)),
+      retainedMiB: Number((retainedBytes / (1024 * 1024)).toFixed(2)),
+    });
+
     if (options.previewCanvas) {
+      currentStage = 'preview-init';
       try {
         preview = createPreviewRenderer(context, options.previewCanvas);
+        logInfo('pipeline', 'Preview enabled', {
+          format: preview.format,
+          width: preview.width,
+          height: preview.height,
+        });
       } catch (error) {
         addWarning(`Preview disabled: ${describeError(error)}`);
         preview = null;
@@ -481,18 +667,39 @@ export async function runFramePipeline(
     const hdrTargetView = hdrRenderer.target.createView();
     const { device } = context;
 
+    currentStage = 'onStart';
     callbacks?.onStart?.({
       frameCount: config.frameCount,
       width: config.width,
       height: config.height,
     });
+    currentStage = 'initial-telemetry';
     emitTelemetry(true);
+    logInfo('pipeline', 'Frame loop starting', {
+      frameCount: config.frameCount,
+      maxFramesInFlight,
+      encoder: encoder ? 'on' : 'off',
+    });
 
     for (let frameIndex = 0; frameIndex < config.frameCount; frameIndex++) {
+      currentFrameIndex = frameIndex;
+      currentStage = `frame ${frameIndex} begin`;
       if (signal?.aborted) {
         cancelled = true;
+        logInfo('pipeline', 'Abort signal observed before frame scheduling', {
+          nextFrameIndex: frameIndex,
+          framesCompleted,
+        });
         break;
       }
+
+      logDebug('pipeline', `frame ${frameIndex} begin`, {
+        pendingReadbacks: pending.length,
+        framesCompleted,
+        encoderQueueSize: encoderQueueSize() ?? 'n/a',
+        deviceLost: deviceLostReason ?? 'no',
+        runElapsedMs: Math.round(performance.now() - runStart),
+      });
 
       // Bounded lookahead: deliver the oldest frame before starting another.
       if (pending.length >= maxFramesInFlight) {
@@ -502,6 +709,10 @@ export async function runFramePipeline(
 
       if (signal?.aborted) {
         cancelled = true;
+        logInfo('pipeline', 'Abort signal observed while delivering lookahead', {
+          nextFrameIndex: frameIndex,
+          framesCompleted,
+        });
         break;
       }
 
@@ -509,10 +720,12 @@ export async function runFramePipeline(
       // `scene.animationTime` is exactly `frameIndex / config.fps`; the timeline
       // is a pure function of the index, so preview/readback timing cannot alter
       // the content of any frame that is produced.
+      currentStage = `frame ${frameIndex} scene-evaluation`;
       const scene = getSceneAtFrame(frameIndex, config);
 
       // Scene and preview share one submission and one command encoder, so the
       // swap-chain texture is acquired exactly once per frame.
+      currentStage = `frame ${frameIndex} render-recording`;
       const commandEncoder = device.createCommandEncoder({
         label: `frame-${frameIndex}-encoder`,
       });
@@ -521,6 +734,7 @@ export async function runFramePipeline(
 
       let previewMs = 0;
       if (preview) {
+        currentStage = `frame ${frameIndex} preview-recording`;
         const previewStart = performance.now();
         try {
           preview.renderPreview(commandEncoder, hdrTargetView);
@@ -533,12 +747,14 @@ export async function runFramePipeline(
         previewMs = performance.now() - previewStart;
       }
 
+      currentStage = `frame ${frameIndex} submit`;
       const submitStart = performance.now();
       device.queue.submit([commandEncoder.finish()]);
       const submitMs = performance.now() - submitStart;
 
       // The readback copy is submitted before the next frame can overwrite the
       // target. With depth >= 2, its map/unpack overlaps the next render.
+      currentStage = `frame ${frameIndex} readback-submit`;
       const job = beginFrameReadback(context, manager, hdrRenderer, frameIndex, config);
       pending.push({
         frameIndex,
@@ -547,49 +763,127 @@ export async function runFramePipeline(
         renderMs: beforePreview - frameStart + submitMs,
         previewMs,
       });
+
+      logDebug('pipeline', `frame ${frameIndex} submitted`, {
+        renderMs: Number((beforePreview - frameStart + submitMs).toFixed(2)),
+        previewMs: Number(previewMs.toFixed(2)),
+        stagingBufferIndex: job.stagingBufferIndex,
+        pendingReadbacks: pending.length,
+      });
     }
 
     cancelled = cancelled || (signal?.aborted ?? false);
 
+    if (cancelled) {
+      logInfo('pipeline', 'Frame scheduling stopped by cancellation', {
+        framesScheduled: framesCompleted + pending.length,
+        framesCompleted,
+        framesTotal: config.frameCount,
+      });
+    } else {
+      logInfo('pipeline', 'All frames scheduled', {
+        framesScheduled: config.frameCount,
+        framesCompleted,
+        pendingReadbacks: pending.length,
+      });
+    }
+
     // Drain in delivery order. Frames whose copies were already submitted are
     // still valid output even if cancellation arrived while they were in flight.
+    currentStage = 'drain-pending-readbacks';
+    logInfo('pipeline', 'Draining pending readbacks', { pendingReadbacks: pending.length });
     while (pending.length > 0) {
       const item = pending.shift();
       if (!item) break;
       await deliver(item);
     }
 
-    await flushAndClose(encoder);
+    if (encoder) {
+      logInfo('pipeline', 'Flushing VideoEncoder', {
+        framesCompleted,
+        framesSubmitted: encoder.status().framesSubmitted,
+        chunksEmitted: encoder.status().chunksEmitted,
+        encodeQueueSize: encoderQueueSize() ?? 'n/a',
+      });
+    }
+    currentStage = 'encoder-flush';
+    await watchForStall(flushAndClose(encoder), 'VideoEncoder flush');
     encoderFlushed = true;
 
+    currentStage = 'finalize';
     const finalTelemetry = buildTelemetry();
     callbacks?.onTelemetry?.(finalTelemetry);
 
-    return {
+    const summary: PipelineSummary = {
       framesCompleted,
       cancelled,
       elapsedMs: performance.now() - runStart,
       telemetry: finalTelemetry,
     };
+
+    logInfo('pipeline', 'Run finished', {
+      framesCompleted,
+      framesTotal: config.frameCount,
+      cancelled,
+      elapsedMs: Math.round(summary.elapsedMs),
+      measuredFps: Number(measuredFps.toFixed(2)),
+      averageFrameMs: Number(averageFrameMs.toFixed(2)),
+      deviceLost: deviceLostReason ?? 'no',
+      warnings: warnings.slice(),
+      encoder: encoder ? toEncoderTelemetry(encoder) : 'off',
+    });
+
+    if (!cancelled && framesCompleted < config.frameCount) {
+      logWarn(
+        'pipeline',
+        `Run finished with ${framesCompleted}/${config.frameCount} frames but no thrown error`,
+        {
+          lastFrameIndex,
+          deviceLost: deviceLostReason ?? 'no',
+          warnings: warnings.slice(),
+        },
+      );
+    }
+
+    return summary;
   } catch (error) {
+    logError(
+      'pipeline',
+      `Run failed after ${framesCompleted}/${config.frameCount} frames`,
+      error,
+      {
+        stage: currentStage,
+        currentFrameIndex,
+        lastFrameIndex,
+        pendingReadbacks: pending.length,
+        activeReadbacks: readbackManager?.activeReadbacks,
+        deviceLost: deviceLostReason ?? 'no',
+        encoderQueueSize: encoderQueueSize() ?? 'n/a',
+        runElapsedMs: Math.round(performance.now() - runStart),
+      },
+    );
     for (const item of pending) {
       item.job.cancel();
     }
     pending.length = 0;
     throw error;
   } finally {
+    currentStage = 'cleanup';
     if (!encoderFlushed) {
+      logDebug('pipeline', 'Flushing VideoEncoder during cleanup');
       try {
-        await flushAndClose(encoder);
+        await watchForStall(flushAndClose(encoder), 'VideoEncoder flush during cleanup');
       } catch (error) {
         addWarning(`VideoEncoder flush failed: ${describeError(error)}`);
       }
     }
+    detachVisibility?.();
     detachDeviceLost?.();
     preview?.dispose();
     readbackManager?.dispose();
     renderer?.dispose();
     destroyGpuContext(context);
+    logDebug('pipeline', 'Cleanup complete', { framesCompleted, cancelled });
   }
 }
 

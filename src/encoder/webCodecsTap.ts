@@ -36,6 +36,8 @@ import type {
   FrameMeta,
 } from '../types/frame.ts';
 
+import { logDebug, logError, logInfo, logWarn } from '../diagnostics/logger.ts';
+
 /** Input pixel formats the tap can pack from a float RGBA frame. */
 export type EncoderFrameFormat = 'I420P10' | 'RGBA';
 
@@ -583,6 +585,7 @@ export async function createVideoEncoderTap(
   options: VideoEncoderTapOptions = {},
 ): Promise<VideoEncoderTap | null> {
   const warn = (message: string): void => {
+    logWarn('encoder', message);
     try {
       options.onWarning?.(message);
     } catch {
@@ -689,6 +692,19 @@ export async function createVideoEncoderTap(
     ),
   );
 
+  logInfo('encoder', 'VideoEncoder tap configured', {
+    codec: selectedCodec,
+    width,
+    height,
+    fps: Number(fps.toFixed(3)),
+    bitrate,
+    transfer,
+    frameFormat,
+    explicitLayout,
+    keyFrameInterval,
+    rejectedCandidates: rejected,
+  });
+
   let encoder: VideoEncoder;
   let framesSubmitted = 0;
   let framesClosed = 0;
@@ -704,6 +720,13 @@ export async function createVideoEncoderTap(
     const message = describeError(error);
     lastError = message;
     if (fatal) failed = true;
+    logError('encoder', fatal ? 'VideoEncoder failed' : 'VideoEncoder output callback failed', error, {
+      framesSubmitted,
+      framesClosed,
+      chunksEmitted,
+      keyFrames,
+      lastError: message,
+    });
     failNotice(error);
   };
 
@@ -751,6 +774,13 @@ export async function createVideoEncoderTap(
   function closeEncoder(): void {
     if (closed) return;
     closed = true;
+    logDebug('encoder', 'Closing VideoEncoder', {
+      framesSubmitted,
+      framesClosed,
+      chunksEmitted,
+      keyFrames,
+      lastError,
+    });
     try {
       encoder.close();
     } catch {
@@ -781,12 +811,30 @@ export async function createVideoEncoderTap(
   }
 
   function flush(): Promise<void> {
-    if (closed) return Promise.resolve();
+    if (closed) {
+      logDebug('encoder', 'Flush requested after close; nothing to do');
+      return Promise.resolve();
+    }
     if (flushPromise) return flushPromise;
+
+    const flushStartedAt = performance.now();
+    logInfo('encoder', 'Flush started', {
+      framesSubmitted,
+      chunksEmitted,
+      encodeQueueSize: currentQueueSize(),
+    });
 
     flushPromise = (async () => {
       try {
         await encoder.flush();
+        logInfo('encoder', 'Flush complete', {
+          elapsedMs: Math.round(performance.now() - flushStartedAt),
+          framesSubmitted,
+          framesClosed,
+          chunksEmitted,
+          chunkBytes,
+          keyFrames,
+        });
       } catch (error) {
         // Flush can reject when the encoder was already torn down; keep the
         // original error visible in telemetry but still close cleanly.
@@ -888,13 +936,17 @@ export async function flushAndClose(tap: VideoEncoderTap | null): Promise<void> 
   if (!tap) return;
   try {
     await tap.flush();
-  } catch {
+  } catch (error) {
     // A rejected flush must not prevent resource release.
+    logError('encoder', 'flushAndClose: tap.flush() failed', error);
   } finally {
     try {
       tap.close();
-    } catch {
+    } catch (error) {
       // Ignore teardown races.
+      logDebug('encoder', 'flushAndClose: tap.close() threw during teardown', {
+        error: describeError(error),
+      });
     }
   }
 }
