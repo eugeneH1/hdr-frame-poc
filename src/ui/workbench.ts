@@ -31,6 +31,7 @@ import { getWorkingColorSpace } from '../timeline/sceneAnimator.ts';
 import { runFramePipeline } from '../pipeline/framePipeline.ts';
 import { createVideoEncoderTap, flushAndClose } from '../encoder/webCodecsTap.ts';
 import type { VideoEncoderTap } from '../encoder/webCodecsTap.ts';
+import type { CollectedVideoChunk, MuxedVideo } from '../encoder/videoMuxer.ts';
 import { describeLogging, logDebug, logError, logInfo, logWarn } from '../diagnostics/logger.ts';
 
 const DEFAULT_WIDTH = 1280;
@@ -194,6 +195,21 @@ function downloadNpyFrame(frame: RetainedFrame): void {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+/** Downloads the finalized muxed HDR video. */
+function downloadMuxedVideo(video: MuxedVideo): void {
+  const blob = new Blob([video.buffer], { type: video.mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download =
+    `hdr-${video.frameCount}f-${video.width}x${video.height}-` +
+    `${video.codec}-${video.transfer}${video.extension}`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 /** Rec. 2100 PQ delivery space used as the default output description. */
 function getRec2100PqColorSpace(): ColorSpaceSpec {
   return {
@@ -280,6 +296,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   let unmounted = false;
   let activeController: AbortController | null = null;
   let retainedFrame: RetainedFrame | null = null;
+  let muxedVideo: MuxedVideo | null = null;
 
   // --- Header ----------------------------------------------------------------
   const container = createElement('div', 'workbench');
@@ -346,6 +363,12 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   downloadButton.title =
     'Download the kept frame as .npy (H×W×4 float32, linear Rec.2020)';
 
+  const downloadVideoButton = createElement('button', 'wb-button', 'Download video');
+  downloadVideoButton.type = 'button';
+  downloadVideoButton.disabled = true;
+  downloadVideoButton.title =
+    'Download the muxed 10-bit HDR video (MP4 for HEVC/AV1, WebM for VP9)';
+
   controls.append(
     formatField,
     encoderField,
@@ -353,6 +376,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     startButton,
     cancelButton,
     downloadButton,
+    downloadVideoButton,
   );
   header.append(headingGroup, stateBadge);
 
@@ -378,6 +402,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   const targetStat = createStat('Active HDR target');
   const retainedStat = createStat('Pipeline retained');
   const keptFrameStat = createStat('Kept frame');
+  const videoStat = createStat('HDR video');
   const fpsStat = createStat('FPS');
   const encoderStat = createStat('VideoEncoder');
   const chunksStat = createStat('Encoded chunks');
@@ -395,6 +420,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     targetStat.cell,
     retainedStat.cell,
     keptFrameStat.cell,
+    videoStat.cell,
     fpsStat.cell,
     encoderStat.cell,
     chunksStat.cell,
@@ -407,9 +433,10 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       'onFrame and released afterwards; only the selected frame is copied for download, so a ' +
       '300-frame run never retains all frames (~4.4 GB if it did). “Download frame” saves the ' +
       'kept frame as .npy (H×W×4 float32, linear Rec.2020). Enable WebCodecs encode to pack ' +
-      'each frame as I420P10 (RGBA fallback) and feed a Rec. 2100 PQ/HLG encoder; chunk counts ' +
-      'and bytes are tracked here, with muxing left to a future phase. 10-bit encoder input ' +
-      'requires the browser to expose I420P10 VideoFrames; otherwise the tap falls back to 8-bit RGBA.',
+      'each frame as I420P10 (RGBA fallback) and feed a Rec. 2100 PQ/HLG encoder; emitted ' +
+      'chunks are muxed into a downloadable MP4/WebM with Rec.2020/PQ/HLG colour metadata. ' +
+      '10-bit encoder input requires the browser to expose I420P10 VideoFrames; otherwise the ' +
+      'tap falls back to 8-bit RGBA.',
   );
 
   // Expected capability fallbacks (currently the 8-bit RGBA input path) belong
@@ -440,6 +467,12 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     downloadButton.disabled = true;
   }
 
+  function clearMuxedVideo(): void {
+    muxedVideo = null;
+    videoStat.value.textContent = '—';
+    downloadVideoButton.disabled = true;
+  }
+
   function onDownloadClick(): void {
     if (!retainedFrame) return;
     logInfo('workbench', 'Downloading retained frame', {
@@ -449,6 +482,17 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       bytes: retainedFrame.pixels.byteLength,
     });
     downloadNpyFrame(retainedFrame);
+  }
+
+  function onDownloadVideoClick(): void {
+    if (!muxedVideo) return;
+    logInfo('workbench', 'Downloading muxed HDR video', {
+      codec: muxedVideo.codec,
+      container: muxedVideo.extension,
+      frameCount: muxedVideo.frameCount,
+      bytes: muxedVideo.buffer.byteLength,
+    });
+    downloadMuxedVideo(muxedVideo);
   }
 
   function onFrameIndexChange(): void {
@@ -578,7 +622,9 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     let returnedFrames = 0;
     let returnedBytes = 0;
     clearRetainedFrame();
+    clearMuxedVideo();
     returnedStat.value.textContent = `0 / ${config.frameCount} · 0 MB`;
+    videoStat.value.textContent = wantEncoder ? 'Pending…' : 'Off';
 
     logInfo('workbench', 'Starting run', {
       width: config.width,
@@ -603,6 +649,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     encoderNote.textContent = '';
 
     let encoderTap: VideoEncoderTap | null = null;
+    const videoChunks: CollectedVideoChunk[] = [];
 
     try {
       if (wantEncoder) {
@@ -622,8 +669,10 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
         try {
           encoderTap = await createVideoEncoderTap(
             createEncoderProbeMeta(config),
-            () => {
-              // Chunk data is intentionally dropped: muxing is out of scope.
+            (chunk, metadata) => {
+              // Keep the encoded packets for muxing after the run. The chunk
+              // objects own their data and remain valid after the callback.
+              videoChunks.push({ chunk, metadata });
             },
             {
               // WebCodecs profiles are tagged Rec.2100 PQ or HLG; linear/unknown
@@ -724,6 +773,72 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
         keptFrameStat.value.textContent = `#${keepFrameIndex} not delivered`;
       }
 
+      if (videoChunks.length > 0 && encoderTap) {
+        videoStat.value.textContent = 'Muxing…';
+        try {
+          // Mediabunny is loaded on demand so a frame-only run never pays its
+          // bundle cost; the muxer is only needed once encoded chunks exist.
+          const { inspectMuxedVideo, muxVideoChunks } = await import(
+            '../encoder/videoMuxer.ts'
+          );
+          muxedVideo = await muxVideoChunks({
+            chunks: videoChunks,
+            codec: encoderTap.codec,
+            width: config.width,
+            height: config.height,
+            fps: config.fps,
+            transfer: config.outputColorSpace.transfer === 'hlg' ? 'hlg' : 'pq',
+          });
+          if (muxedVideo) {
+            const megabytes = (muxedVideo.buffer.byteLength / (1024 * 1024)).toFixed(2);
+            let verification = '';
+            try {
+              const inspection = await inspectMuxedVideo(muxedVideo);
+              logInfo('workbench', 'Muxed video self-check', {
+                codec: inspection.codec,
+                width: inspection.width,
+                height: inspection.height,
+                durationSeconds: inspection.durationSeconds,
+                colorSpace: inspection.colorSpace,
+                highDynamicRange: inspection.highDynamicRange,
+              });
+              const primaries = inspection.colorSpace.primaries ?? '?';
+              const transfer = inspection.colorSpace.transfer ?? '?';
+              verification =
+                ` · ${primaries}/${transfer}` +
+                (inspection.highDynamicRange ? ' · HDR ✓' : ' · HDR ?');
+              if (!inspection.highDynamicRange) {
+                logWarn('workbench', 'Muxed video did not report HDR metadata', {
+                  colorSpace: inspection.colorSpace,
+                  codec: inspection.codec,
+                });
+              }
+            } catch (error) {
+              logWarn('workbench', 'Muxed video self-check failed', {
+                error: describeError(error),
+              });
+            }
+            videoStat.value.textContent =
+              `${muxedVideo.extension.slice(1)} · ${megabytes} MB · ` +
+              `${muxedVideo.frameCount} chunks · ${muxedVideo.codec}/${muxedVideo.transfer}` +
+              verification;
+            downloadVideoButton.disabled = false;
+          } else {
+            videoStat.value.textContent = 'No encoded chunks';
+          }
+        } catch (error) {
+          videoStat.value.textContent = 'Mux failed';
+          logError('workbench', 'Muxing HDR video failed', error, {
+            chunks: videoChunks.length,
+            codec: encoderTap.codec,
+          });
+          showWarning(`Video mux failed: ${describeError(error)}`);
+        }
+      } else if (wantEncoder) {
+        videoStat.value.textContent = 'No encoded chunks';
+        logWarn('workbench', 'Encoder was requested but produced no chunks to mux');
+      }
+
       logInfo('workbench', summary.cancelled ? 'Run cancelled' : 'Run complete', {
         framesCompleted: summary.framesCompleted,
         framesReturned: returnedFrames,
@@ -793,6 +908,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     cancelButton.removeEventListener('click', onCancelClick);
     encoderToggle.removeEventListener('change', onEncoderToggleChange);
     downloadButton.removeEventListener('click', onDownloadClick);
+    downloadVideoButton.removeEventListener('click', onDownloadVideoClick);
     frameIndexInput.removeEventListener('change', onFrameIndexChange);
     container.remove();
   }
@@ -811,6 +927,8 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       if (!encoderToggle.checked) {
         encoderNote.hidden = true;
         encoderNote.textContent = '';
+        clearMuxedVideo();
+        videoStat.value.textContent = 'Off';
       }
     }
   }
@@ -819,6 +937,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   cancelButton.addEventListener('click', onCancelClick);
   encoderToggle.addEventListener('change', onEncoderToggleChange);
   downloadButton.addEventListener('click', onDownloadClick);
+  downloadVideoButton.addEventListener('click', onDownloadVideoClick);
   frameIndexInput.addEventListener('change', onFrameIndexChange);
   updateEncoderReadout(null, false);
 

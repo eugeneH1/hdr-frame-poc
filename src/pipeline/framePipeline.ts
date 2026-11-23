@@ -68,6 +68,14 @@ const STALL_LOG_INTERVAL_MS = 5000;
 const ENCODER_QUEUE_WARN_THRESHOLD = 16;
 /** Minimum gap between encoder back-pressure warnings. */
 const ENCODER_QUEUE_WARN_INTERVAL_MS = 2000;
+/**
+ * Encoder queue depth at which the pipeline pauses before submitting another
+ * frame and waits for the encoder to drain. Without this the queue grows for the
+ * whole run and the final flush has to encode the entire backlog.
+ */
+const ENCODER_QUEUE_DRAIN_THRESHOLD = 8;
+/** Upper bound on the final flush; a wedged encoder is force-closed after this. */
+const ENCODER_FLUSH_TIMEOUT_MS = 30_000;
 
 /** Metadata reported when a run starts. */
 export interface PipelineStartInfo {
@@ -385,6 +393,61 @@ export async function runFramePipeline(
   }
 
   /**
+   * Encoder counters for stall diagnostics. `chunksEmitted` advancing between
+   * watchdog ticks means the encoder is slow; a frozen value means it is stuck.
+   */
+  function encoderCounters(): Record<string, number> {
+    if (!encoder) return {};
+    try {
+      const status = encoder.status();
+      return {
+        encoderFramesSubmitted: status.framesSubmitted,
+        encoderFramesClosed: status.framesClosed,
+        encoderChunksEmitted: status.chunksEmitted,
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Flushes and closes the tap, but never waits forever. A flush that has not
+   * settled within `ENCODER_FLUSH_TIMEOUT_MS` is abandoned and the encoder is
+   * force-closed so the run can still return once frames are all delivered.
+   */
+  async function flushEncoderBounded(): Promise<void> {
+    const tap = encoder;
+    if (!tap) {
+      await flushAndClose(null);
+      return;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        try {
+          tap.close();
+        } catch {
+          // Ignore teardown races.
+        }
+        reject(
+          new Error(
+            `VideoEncoder flush did not settle within ${ENCODER_FLUSH_TIMEOUT_MS} ms; encoder force-closed`,
+          ),
+        );
+      }, ENCODER_FLUSH_TIMEOUT_MS);
+    });
+
+    try {
+      // `flushAndClose` swallows flush rejections, so race it against our own
+      // hard timeout to distinguish a slow encoder from a wedged one.
+      await Promise.race([flushAndClose(tap), timeout]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  }
+
+  /**
    * Awaits `work`, logging the pipeline's state every few seconds until it
    * settles. Readback maps and encoder flushes can stall indefinitely after a
    * device loss; without this, a hung run looks identical to a slow one and
@@ -407,6 +470,7 @@ export async function runFramePipeline(
           typeof document !== 'undefined' ? document.visibilityState : 'unknown',
         encoderQueueSize: encoderQueueSize() ?? 'n/a',
         runElapsedMs: Math.round(performance.now() - runStart),
+        ...encoderCounters(),
       });
     }, STALL_LOG_INTERVAL_MS);
 
@@ -494,10 +558,26 @@ export async function runFramePipeline(
 
       let encodeMs = 0;
       if (encoder) {
+        // Back-pressure: if the encoder is behind, wait for it to catch up before
+        // queueing another frame. This bounds queue growth and keeps the final
+        // flush short instead of draining the whole run's backlog.
+        const queued = encoderQueueSize() ?? 0;
+        if (queued >= ENCODER_QUEUE_DRAIN_THRESHOLD) {
+          currentStage = `frame ${item.frameIndex} encoder-drain`;
+          const drainStart = performance.now();
+          logDebug('pipeline', 'Encoder back-pressure: draining before submit', {
+            frameIndex: item.frameIndex,
+            encodeQueueSize: queued,
+            framesCompleted,
+          });
+          await watchForStall(encoder.drain(), 'VideoEncoder back-pressure drain');
+          encodeMs += performance.now() - drainStart;
+        }
+
         currentStage = `frame ${item.frameIndex} encode`;
         const encodeStart = performance.now();
         const accepted = encodeFrame(encoder, frameForEncode, item.frameIndex === 0);
-        encodeMs = performance.now() - encodeStart;
+        encodeMs += performance.now() - encodeStart;
 
         if (!accepted && !encoderWarningIssued) {
           encoderWarningIssued = true;
@@ -807,7 +887,13 @@ export async function runFramePipeline(
       });
     }
     currentStage = 'encoder-flush';
-    await watchForStall(flushAndClose(encoder), 'VideoEncoder flush');
+    try {
+      await watchForStall(flushEncoderBounded(), 'VideoEncoder flush');
+    } catch (error) {
+      // Every frame was already delivered; losing trailing chunks is a warning,
+      // not a reason to discard an otherwise complete run.
+      addWarning(`VideoEncoder flush timed out: ${describeError(error)}`);
+    }
     encoderFlushed = true;
 
     currentStage = 'finalize';
@@ -872,7 +958,7 @@ export async function runFramePipeline(
     if (!encoderFlushed) {
       logDebug('pipeline', 'Flushing VideoEncoder during cleanup');
       try {
-        await watchForStall(flushAndClose(encoder), 'VideoEncoder flush during cleanup');
+        await watchForStall(flushEncoderBounded(), 'VideoEncoder flush during cleanup');
       } catch (error) {
         addWarning(`VideoEncoder flush failed: ${describeError(error)}`);
       }

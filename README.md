@@ -4,7 +4,7 @@
 
 The pipeline emits verbose console diagnostics by default. Lines are prefixed
 with `[hdr-frame-poc:<scope> +<seconds>s]`, where the scope is one of `pipeline`,
-`gpu`, `readback`, `encoder`, `workbench`, or `app`.
+`gpu`, `readback`, `encoder`, `muxer`, `workbench`, or `app`.
 
 While a run is active you get:
 
@@ -60,6 +60,11 @@ section will be expanded into the final README.
   sRGB encoding, and presents it on the canvas while frames are produced.
 - An optional WebCodecs tap converts each float frame to `I420P10` (or 8-bit
   `RGBA` fallback) and feeds a 10-bit Rec. 2100 PQ/HLG `VideoEncoder`.
+- Emitted `EncodedVideoChunk`s are collected and muxed with Mediabunny into an
+  in-memory MP4 (HEVC/AV1) or WebM (VP9) file. The muxer is loaded on demand so
+  frame-only runs do not pay its bundle cost. The container is then read back
+  through Mediabunny's demuxer to self-check codec, dimensions, duration, colour
+  primaries/transfer and the HDR flag.
 
 ### Decisions to explain in the final README
 
@@ -81,8 +86,16 @@ section will be expanded into the final README.
   does not yet perform a Rec. 2020 -> Rec. 709 gamut conversion, so highly
   saturated Rec. 2020 colors are not a colour-managed SDR rendering.
 - **Encoder metadata:** the tap tags each `VideoFrame` with Rec. 2020 / PQ or
-  HLG / `bt2020-ncl`; the encoder is configured for a 10-bit profile. Chunks are
-  currently counted but not muxed.
+  HLG / `bt2020-ncl`; the encoder is configured for a 10-bit profile. Emitted
+  chunks are muxed into MP4 or WebM, and the muxer overlays the intended
+  Rec.2020/PQ/HLG colour description on the first packet so the container gets a
+  `colr`/`Colour` element even when the browser omits it.
+- **Container choice:** HEVC/AV1 use MP4 for broad HDR playback support; VP9 uses
+  WebM because VP9-in-MP4 is much less portable. The finalized 10-second file is
+  held in memory (`BufferTarget`) for a simple download.
+- **Muxing library:** Mediabunny 1.66.2 (MPL-2.0), loaded via dynamic import only
+  when encoded chunks exist. It writes container colour tags from the first
+  packet's decoder config and can read the file back for the in-app self-check.
 
 ### Browser limitations and risks
 
@@ -95,20 +108,28 @@ section will be expanded into the final README.
 - `rgba32float` is only usable with the optional renderable/blendable features;
   the context falls back to `rgba16float` otherwise.
 - WebCodecs codec availability varies by OS/browser/hardware (HEVC, AV1, VP9
-  Profile 2; software encoders can be very slow). The encoder queue is currently
-  unbounded and only warned about at depth 16.
+  Profile 2; software encoders can be very slow). The pipeline pauses before
+  submitting a frame once `encodeQueueSize` reaches 8, waiting for a
+  `VideoEncoder.flush()` to drain the queue. The final flush is bounded at 30s
+  and force-closes a wedged encoder so a run cannot hang indefinitely.
+- If the browser exposes no supported 10-bit encoder profile, no chunks are
+  produced and no video can be downloaded; the frame pipeline still completes.
+- Muxing writes container colour tags (`colr`/`Colour`) but not mastering-display
+  (`mdcv`) or content-light (`clli`) metadata; players may apply their own tone
+  mapping.
 - HDR canvas presentation is not portable across browsers/displays; the live
   preview is deliberately SDR tone-mapped.
 - Background tabs can throttle timers and presentation; frame content is still
   deterministic because it never depends on wall-clock time.
 - Large readbacks and float expansions create GC/memory pressure; the staging
   ring and `reuseOutputBuffer` option bound the pipeline's own allocations.
-- No muxer yet, so no container-level `colr`/`mdcv`/`clli` boxes and no
-  downloadable HDR video.
+- The muxer holds the full encoded video in memory (~a few MB at this bitrate);
+  a longer/higher-bitrate export should stream to disk via `StreamTarget`.
 
 ### Optimisation roadmap
 
 - Bound `VideoEncoder.encodeQueueSize` and pause/drop frames under back-pressure.
+  (Pausing is implemented; dropping frames would require a timestamp policy.)
 - Offload readback unpacking and encoding to a worker; `VideoFrame` is
   transferable.
 - Expose `reuseOutputBuffer` to remove per-frame 14.75 MB CPU allocations.
@@ -125,23 +146,29 @@ section will be expanded into the final README.
 ### Verification and next steps
 
 - `pnpm build` runs TypeScript and the Vite production build.
+- The muxing path was smoke-tested in Node with synthetic VP9 chunks: the
+  resulting WebM round-trips through Mediabunny's demuxer with
+  `bt2020` / `pq` / `bt2020-ncl`, `hasHighDynamicRange() === true`, and the
+  expected duration. A browser run still needs to validate actual encoder
+  output and codec availability.
 - No automated tests yet. Good candidates: matrix composition, timeline
   determinism/loop seam, half-float decode, I420/RGBA packers, and an end-to-end
   browser run asserting 300 `onFrame` deliveries and HDR values above 1.0.
-- Muxing the encoder output (for example with `mp4-muxer`) and verifying the
-  color metadata in the resulting file is the next functional milestone beyond
-  the core frame-generation brief.
+- Verifying the downloaded file with `ffprobe`
+  (`pix_fmt`, `color_primaries`, `color_transfer`, `color_space`) is the next
+  validation step for real encoder output; the in-app self-check covers the
+  same fields through Mediabunny.
 
 ### Open items
 
 - [x] Deliver Float32 frames through `onFrame`, count them in the UI, retain one
   selected frame and download it as `.npy`.
-- [ ] Add automated unit/end-to-end tests and CI.
-- [ ] Mux 10-bit HDR chunks into a playable MP4/WebM and inspect the colour
+- [x] Mux 10-bit HDR chunks into a playable MP4/WebM and self-check the colour
   metadata that reaches the container.
+- [ ] Add automated unit/end-to-end tests and CI.
 - [ ] Add a Rec. 2020 -> Rec. 709 gamut matrix to the SDR preview (and document
   the tone curve).
-- [ ] Apply encoder back-pressure instead of only warning about queue depth.
+- [x] Apply encoder back-pressure instead of only warning about queue depth.
 - [ ] Fail the run promptly on GPU device loss and reject in-flight readbacks.
 - [ ] Render text (Canvas 2D/SDF source, linearized and scaled into HDR range).
 - [ ] Investigate/present HDR output accurately where the browser supports it.

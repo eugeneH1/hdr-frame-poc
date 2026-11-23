@@ -62,6 +62,13 @@ export interface VideoEncoderTap {
   /** Frames still held by the encoder's internal queue (backpressure signal). */
   encodeQueueSize(): number;
   /**
+   * Waits for the encoder to process everything queued so far without closing
+   * it. The tap stays configured afterwards, so callers can use this to apply
+   * back-pressure mid-run. Resolves immediately when the queue is empty, and is
+   * a no-op after close or a fatal error.
+   */
+  drain(): Promise<void>;
+  /**
    * Converts and submits one frame. Returns `false` when the tap is closed,
    * errored, or the frame was rejected. The intermediate `VideoFrame` is always
    * closed before this method returns.
@@ -828,6 +835,24 @@ export async function createVideoEncoderTap(
     };
   }
 
+  async function drain(): Promise<void> {
+    if (closed || failed) return;
+    const queued = currentQueueSize();
+    if (queued === 0) return;
+    logDebug('encoder', 'Draining encoder queue', {
+      encodeQueueSize: queued,
+      framesSubmitted,
+      chunksEmitted,
+    });
+    try {
+      // `VideoEncoder.flush()` emits everything queued but leaves the encoder
+      // configured, which is exactly the back-pressure we need mid-run.
+      await encoder.flush();
+    } catch (error) {
+      reportError(error, true);
+    }
+  }
+
   function flush(): Promise<void> {
     if (closed) {
       logDebug('encoder', 'Flush requested after close; nothing to do');
@@ -869,6 +894,7 @@ export async function createVideoEncoderTap(
     frameFormat,
     status,
     encodeQueueSize: currentQueueSize,
+    drain,
     flush,
     close: closeEncoder,
 
