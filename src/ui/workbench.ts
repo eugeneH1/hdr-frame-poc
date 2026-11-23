@@ -468,7 +468,9 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     }
 
     const formatLabel =
-      status.frameFormat === 'RGBA' ? 'RGBA (8-bit fallback)' : status.frameFormat;
+      status.frameFormat === 'I420P10'
+        ? 'I420P10 (10-bit)'
+        : `${status.frameFormat} (8-bit fallback)`;
     encoderStat.value.textContent =
       `${status.state} · ${status.codec} · ${formatLabel} · ${status.colorSpace}`;
     chunksStat.value.textContent =

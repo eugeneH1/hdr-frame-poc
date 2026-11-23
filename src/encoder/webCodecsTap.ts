@@ -18,9 +18,14 @@
  *   range, 10-bit samples in the low bits of little-endian 16-bit words). The
  *   WebCodecs `VideoFrame(BufferSource, ...)` constructor only accepts 8-bit
  *   formats in current browsers (`I420`, `NV12`, `RGBA`, `BGRA`, ...), so the
- *   tap probes `I420P10` and falls back to opaque 8-bit `RGBA`. That is an
- *   expected capability fallback and is reported through `onInfo`, not
- *   `onWarning`: encoding still works and the output keeps Rec. 2100 metadata.
+ *   tap probes `I420P10`, then 8-bit planar `I420`, then opaque `RGBA`. I420 is
+ *   preferred over RGBA because the pipeline does the Rec. 2020 YUV conversion
+ *   and limited-range quantization itself instead of leaving it to the codec,
+ *   and because it is 1.5 bytes/pixel rather than 4. These are expected
+ *   capability fallbacks and are reported through `onInfo`, not `onWarning`:
+ *   encoding still works and the output keeps Rec. 2100 metadata. Both 8-bit
+ *   paths apply an 8x8 ordered (Bayer) dither before quantisation so smooth PQ
+ *   gradients degrade into fine noise instead of visible banding.
  *   No clamping happens before the transfer function, and the CPU pixels
  *   remain linear Rec. 2020.
  * - **Orientation:** pixels are top-down in both `FloatFrame` and the packed
@@ -43,7 +48,7 @@ import type {
 import { logDebug, logError, logInfo, logWarn } from '../diagnostics/logger.ts';
 
 /** Input pixel formats the tap can pack from a float RGBA frame. */
-export type EncoderFrameFormat = 'I420P10' | 'RGBA';
+export type EncoderFrameFormat = 'I420P10' | 'I420' | 'RGBA';
 
 /** Status snapshot for the optional tap. */
 export interface EncoderTapStatus extends EncoderTelemetry {
@@ -61,6 +66,14 @@ export interface VideoEncoderTap {
   status(): EncoderTapStatus;
   /** Frames still held by the encoder's internal queue (backpressure signal). */
   encodeQueueSize(): number;
+  /**
+   * Waits for the encoder to process everything queued so far **without closing
+   * it**, so the tap can be used again afterwards. Resolves immediately when the
+   * queue is empty and is a no-op after `close()` or a fatal error. Callers use
+   * this to apply back-pressure during a run; `flush()` is the end-of-run form
+   * that also releases the encoder.
+   */
+  drain(): Promise<void>;
   /**
    * Converts and submits one frame. Returns `false` when the tap is closed,
    * errored, or the frame was rejected. The intermediate `VideoFrame` is always
@@ -88,7 +101,7 @@ export interface VideoEncoderTapOptions {
   readonly codecs?: readonly string[];
   /** Rec. 2100 transfer function; default `'pq'`. */
   readonly transfer?: 'pq' | 'hlg';
-  /** Preferred input format; default `'I420P10'` with RGBA fallback. */
+  /** Preferred input format; default `'I420P10'` with `I420`/`RGBA` fallback. */
   readonly frameFormat?: EncoderFrameFormat;
   /** Target bitrate in bits/s. Defaults to a 720p-friendly HDR bitrate. */
   readonly bitrate?: number;
@@ -167,6 +180,32 @@ const Y_B = 0.0593;
 const CB_DIVISOR = 1.8814;
 const CR_DIVISOR = 1.4746;
 
+/**
+ * 8x8 Bayer matrix (0..63). Applied as a sub-LSB offset before rounding, so 8-bit
+ * quantization error is spread spatially instead of collapsing smooth gradients
+ * into visible bands. Applied only to the 8-bit fallback formats; 10-bit error is
+ * already below the perceptual threshold for this content.
+ */
+const BAYER_8X8: readonly number[] = [
+  0, 32, 8, 40, 2, 34, 10, 42,
+  48, 16, 56, 24, 50, 18, 58, 26,
+  12, 44, 4, 36, 14, 46, 6, 38,
+  60, 28, 52, 20, 62, 30, 54, 22,
+  3, 35, 11, 43, 1, 33, 9, 41,
+  51, 19, 59, 27, 49, 17, 57, 25,
+  15, 47, 7, 39, 13, 45, 5, 37,
+  63, 31, 55, 23, 61, 29, 53, 21,
+];
+
+/** Centered dither offsets in code units: `(bayer + 0.5) / 64 - 0.5`, within ±0.5. */
+const DITHER_OFFSETS: Float32Array = (() => {
+  const offsets = new Float32Array(BAYER_8X8.length);
+  for (let i = 0; i < BAYER_8X8.length; i++) {
+    offsets[i] = (BAYER_8X8[i] + 0.5) / 64 - 0.5;
+  }
+  return offsets;
+})();
+
 let pqLut: Float32Array | null = null;
 let hlgLut: Float32Array | null = null;
 
@@ -235,15 +274,34 @@ function encodeTransfer(linear: number, lut: Float32Array): number {
   return low + (high - low) * fraction;
 }
 
-function quantizeLuma(value: number): number {
-  const code = Math.round(64 + 876 * clamp01(value));
-  return code < 64 ? 64 : code > 940 ? 940 : code;
+function quantizeLuma(
+  value: number,
+  min: number,
+  range: number,
+  max: number,
+  dither: number = 0,
+): number {
+  const code = Math.round(min + range * clamp01(value) + dither);
+  return code < min ? min : code > max ? max : code;
 }
 
-function quantizeChroma(value: number): number {
+function quantizeChroma(
+  value: number,
+  center: number,
+  range: number,
+  min: number,
+  max: number,
+  dither: number = 0,
+): number {
   const centered = value < -0.5 ? -0.5 : value > 0.5 ? 0.5 : value;
-  const code = Math.round(512 + 896 * centered);
-  return code < 64 ? 64 : code > 960 ? 960 : code;
+  const code = Math.round(center + range * centered + dither);
+  return code < min ? min : code > max ? max : code;
+}
+
+/** Quantizes a normalized 0..1 channel to `0..max` with an optional dither offset. */
+function quantizeFullRange(value: number, max: number, dither: number): number {
+  const code = Math.round(clamp01(value) * max + dither);
+  return code < 0 ? 0 : code > max ? max : code;
 }
 
 function describeError(error: unknown): string {
@@ -255,21 +313,32 @@ function positiveInteger(value: number): number {
 }
 
 /**
- * Packs linear float RGBA into limited-range I420P10 (Y, U, V planes; 10 bits in
- * the low bits of little-endian 16-bit samples). Alpha is discarded.
+ * Packs linear float RGBA into limited-range planar I420 (Y, U, V; 4:2:0).
+ * 10-bit samples go in the low bits of little-endian 16-bit words (Y 64..940,
+ * C 64..960); 8-bit samples use the conventional limited range (Y 16..235,
+ * C 16..240). Alpha is discarded.
  */
-function packI420P10(
+function packI420(
   pixels: Float32Array,
   width: number,
   height: number,
   transfer: 'pq' | 'hlg',
-  output: Uint16Array,
+  output: Uint8Array | Uint16Array,
+  tenBit: boolean,
 ): void {
   const lut = getTransferLut(transfer);
   const chromaWidth = Math.ceil(width / 2);
   const yPlane = 0;
   const uPlane = width * height;
   const vPlane = uPlane + chromaWidth * Math.ceil(height / 2);
+
+  const lumaMin = tenBit ? 64 : 16;
+  const lumaRange = tenBit ? 876 : 219;
+  const lumaMax = tenBit ? 940 : 235;
+  const chromaCenter = tenBit ? 512 : 128;
+  const chromaRange = tenBit ? 896 : 224;
+  const chromaMin = tenBit ? 64 : 16;
+  const chromaMax = tenBit ? 960 : 240;
 
   for (let y = 0; y < height; y += 2) {
     for (let x = 0; x < width; x += 2) {
@@ -279,6 +348,8 @@ function packI420P10(
 
       for (let dy = 0; dy < 2 && y + dy < height; dy++) {
         const row = (y + dy) * width;
+        // Ordered dither is applied in the 8-bit path only; 10-bit has headroom.
+        const ditherRow = tenBit ? 0 : ((y + dy) & 7) << 3;
         for (let dx = 0; dx < 2 && x + dx < width; dx++) {
           const pixel = (row + x + dx) * 4;
           const r = encodeTransfer(pixels[pixel], lut);
@@ -286,7 +357,14 @@ function packI420P10(
           const b = encodeTransfer(pixels[pixel + 2], lut);
 
           const luma = Y_R * r + Y_G * g + Y_B * b;
-          output[yPlane + row + x + dx] = quantizeLuma(luma);
+          const dither = tenBit ? 0 : DITHER_OFFSETS[ditherRow + ((x + dx) & 7)];
+          output[yPlane + row + x + dx] = quantizeLuma(
+            luma,
+            lumaMin,
+            lumaRange,
+            lumaMax,
+            dither,
+          );
           cbSum += (b - luma) / CB_DIVISOR;
           crSum += (r - luma) / CR_DIVISOR;
           samples++;
@@ -294,8 +372,31 @@ function packI420P10(
       }
 
       const chromaIndex = (y >> 1) * chromaWidth + (x >> 1);
-      output[uPlane + chromaIndex] = quantizeChroma(cbSum / samples);
-      output[vPlane + chromaIndex] = quantizeChroma(crSum / samples);
+      const chromaX = x >> 1;
+      const chromaY = y >> 1;
+      // Distinct spatial offsets keep Cb/Cr noise from aligning with luma.
+      const cbDither = tenBit
+        ? 0
+        : DITHER_OFFSETS[(((chromaY + 3) & 7) << 3) + ((chromaX + 5) & 7)];
+      const crDither = tenBit
+        ? 0
+        : DITHER_OFFSETS[(((chromaY + 1) & 7) << 3) + ((chromaX + 2) & 7)];
+      output[uPlane + chromaIndex] = quantizeChroma(
+        cbSum / samples,
+        chromaCenter,
+        chromaRange,
+        chromaMin,
+        chromaMax,
+        cbDither,
+      );
+      output[vPlane + chromaIndex] = quantizeChroma(
+        crSum / samples,
+        chromaCenter,
+        chromaRange,
+        chromaMin,
+        chromaMax,
+        crDither,
+      );
     }
   }
 }
@@ -309,15 +410,28 @@ function packRgba8(
   output: Uint8Array,
 ): void {
   const lut = getTransferLut(transfer);
-  const pixelCount = width * height;
 
-  for (let pixel = 0; pixel < pixelCount; pixel++) {
-    const source = pixel * 4;
-    const target = source;
-    output[target] = Math.round(encodeTransfer(pixels[source], lut) * 255);
-    output[target + 1] = Math.round(encodeTransfer(pixels[source + 1], lut) * 255);
-    output[target + 2] = Math.round(encodeTransfer(pixels[source + 2], lut) * 255);
-    output[target + 3] = 255;
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    const ditherRow = (y & 7) << 3;
+    for (let x = 0; x < width; x++) {
+      const pixel = row + x;
+      const source = pixel * 4;
+      const target = source;
+      const dither = DITHER_OFFSETS[ditherRow + (x & 7)];
+      output[target] = quantizeFullRange(encodeTransfer(pixels[source], lut), 255, dither);
+      output[target + 1] = quantizeFullRange(
+        encodeTransfer(pixels[source + 1], lut),
+        255,
+        dither,
+      );
+      output[target + 2] = quantizeFullRange(
+        encodeTransfer(pixels[source + 2], lut),
+        255,
+        dither,
+      );
+      output[target + 3] = 255;
+    }
   }
 }
 
@@ -358,6 +472,21 @@ function getI420P10Layout(width: number, height: number): I420P10LayoutInfo {
   };
 }
 
+interface I420LayoutInfo {
+  /** Total tightly-packed bytes across the three 8-bit planes. */
+  readonly totalBytes: number;
+}
+
+/**
+ * Computes the tightly packed I420 layout. WebCodecs' default layout is the same
+ * tight packing, so no explicit `layout` is needed for 8-bit planes.
+ */
+function getI420Layout(width: number, height: number): I420LayoutInfo {
+  const chromaWidth = Math.ceil(width / 2);
+  const chromaHeight = Math.ceil(height / 2);
+  return { totalBytes: width * height + chromaWidth * chromaHeight * 2 };
+}
+
 function makeI420P10Packer(
   width: number,
   height: number,
@@ -377,7 +506,7 @@ function makeI420P10Packer(
         );
       }
       const output = (scratch ??= new Uint16Array(totalSamples));
-      packI420P10(frame.pixels, width, height, transfer, output);
+      packI420(frame.pixels, width, height, transfer, output, true);
       return output;
     },
     init(frame) {
@@ -388,6 +517,45 @@ function makeI420P10Packer(
         timestamp: frame.meta.timestampUs,
         duration: frame.meta.durationUs,
         ...(explicitLayout ? { layout } : {}),
+        colorSpace: {
+          primaries: 'bt2020',
+          transfer,
+          matrix: 'bt2020-ncl',
+          fullRange: false,
+        },
+      };
+    },
+  };
+}
+
+function makeI420Packer(
+  width: number,
+  height: number,
+  transfer: 'pq' | 'hlg',
+): FramePacker {
+  const lumaSamples = width * height;
+  const { totalBytes } = getI420Layout(width, height);
+  let scratch: Uint8Array | null = null;
+
+  return {
+    format: 'I420',
+    pack(frame) {
+      if (frame.pixels.length < lumaSamples * 4) {
+        throw new Error(
+          `encoder.webCodecsTap: frame has ${frame.pixels.length} floats, expected at least ${lumaSamples * 4}`,
+        );
+      }
+      const output = (scratch ??= new Uint8Array(totalBytes));
+      packI420(frame.pixels, width, height, transfer, output, false);
+      return output;
+    },
+    init(frame) {
+      return {
+        format: 'I420',
+        codedWidth: width,
+        codedHeight: height,
+        timestamp: frame.meta.timestampUs,
+        duration: frame.meta.durationUs,
         colorSpace: {
           primaries: 'bt2020',
           transfer,
@@ -532,6 +700,49 @@ function probeI420P10(
   return { ok: false, explicitLayout: false, error: [...errors].join('; ') };
 }
 
+function tryI420Frame(
+  width: number,
+  height: number,
+  transfer: 'pq' | 'hlg',
+): string | null {
+  let probe: VideoFrame | null = null;
+  try {
+    const { totalBytes } = getI420Layout(width, height);
+    const init: HdrVideoFrameInit = {
+      format: 'I420',
+      codedWidth: width,
+      codedHeight: height,
+      timestamp: 0,
+      duration: 1,
+      colorSpace: buildColorSpace(transfer, 'bt2020-ncl', false),
+    };
+    probe = new VideoFrame(
+      new Uint8Array(totalBytes),
+      init as unknown as VideoFrameBufferInit,
+    );
+    return null;
+  } catch (error) {
+    return describeError(error);
+  } finally {
+    try {
+      probe?.close();
+    } catch {
+      // Ignore probe teardown races.
+    }
+  }
+}
+
+function probeI420(
+  width: number,
+  height: number,
+  transfer: 'pq' | 'hlg',
+): FrameProbeResult {
+  const error = tryI420Frame(width, height, transfer);
+  return error
+    ? { ok: false, explicitLayout: false, error }
+    : { ok: true, explicitLayout: false, error: null };
+}
+
 function tryRgbaFrame(
   width: number,
   height: number,
@@ -674,20 +885,41 @@ export async function createVideoEncoderTap(
     if (probe.ok) {
       explicitLayout = probe.explicitLayout;
     } else {
-      const rgbaProbe = probeRgba(width, height, transfer);
-      if (!rgbaProbe.ok) {
-        warn(
-          `No usable VideoFrame input format in this UA ` +
-            `(I420P10: ${probe.error ?? 'unavailable'}; RGBA: ${rgbaProbe.error ?? 'unavailable'}).`,
+      const i420Probe = probeI420(width, height, transfer);
+      if (i420Probe.ok) {
+        info(
+          `This browser cannot construct 10-bit I420P10 VideoFrames from CPU buffers ` +
+            `(${probe.error ?? 'format unsupported'}); using 8-bit planar I420 input instead. ` +
+            'The encoder still targets Rec.2020 PQ/HLG, but source precision is 8-bit.',
         );
-        return null;
+        frameFormat = 'I420';
+      } else {
+        const rgbaProbe = probeRgba(width, height, transfer);
+        if (!rgbaProbe.ok) {
+          warn(
+            `No usable VideoFrame input format in this UA ` +
+              `(I420P10: ${probe.error ?? 'unavailable'}; ` +
+              `I420: ${i420Probe.error ?? 'unavailable'}; ` +
+              `RGBA: ${rgbaProbe.error ?? 'unavailable'}).`,
+          );
+          return null;
+        }
+        info(
+          `This browser cannot construct 10-bit I420P10 or 8-bit I420 VideoFrames ` +
+            `from CPU buffers (I420P10: ${probe.error ?? 'unsupported'}; ` +
+            `I420: ${i420Probe.error ?? 'unsupported'}); using 8-bit RGBA input instead. ` +
+            'The encoder still targets Rec.2020 PQ/HLG, but source precision is 8-bit.',
+        );
+        frameFormat = 'RGBA';
       }
-      info(
-        `This browser cannot construct 10-bit I420P10 VideoFrames from CPU buffers ` +
-          `(${probe.error ?? 'format unsupported'}); using 8-bit RGBA input instead. ` +
-          'The encoder still targets Rec.2020 PQ/HLG, but source precision is 8-bit.',
+    }
+  } else if (frameFormat === 'I420') {
+    const probe = probeI420(width, height, transfer);
+    if (!probe.ok) {
+      warn(
+        `I420 VideoFrames are unavailable in this UA (${probe.error ?? 'unsupported'}).`,
       );
-      frameFormat = 'RGBA';
+      return null;
     }
   } else {
     const rgbaProbe = probeRgba(width, height, transfer);
@@ -702,7 +934,9 @@ export async function createVideoEncoderTap(
   const packer =
     frameFormat === 'I420P10'
       ? makeI420P10Packer(width, height, transfer, explicitLayout)
-      : makeRgbaPacker(width, height, transfer);
+      : frameFormat === 'I420'
+        ? makeI420Packer(width, height, transfer)
+        : makeRgbaPacker(width, height, transfer);
   const keyFrameInterval = Math.max(
     0,
     Math.floor(
@@ -828,6 +1062,26 @@ export async function createVideoEncoderTap(
     };
   }
 
+  async function drain(): Promise<void> {
+    if (closed || failed) return;
+    const queued = currentQueueSize();
+    if (queued === 0) return;
+
+    logDebug('encoder', 'Draining encoder queue', {
+      encodeQueueSize: queued,
+      framesSubmitted,
+      chunksEmitted,
+    });
+
+    try {
+      // `VideoEncoder.flush()` emits everything queued but leaves the encoder
+      // configured, which is the back-pressure primitive needed mid-run.
+      await encoder.flush();
+    } catch (error) {
+      reportError(error, true);
+    }
+  }
+
   function flush(): Promise<void> {
     if (closed) {
       logDebug('encoder', 'Flush requested after close; nothing to do');
@@ -869,6 +1123,7 @@ export async function createVideoEncoderTap(
     frameFormat,
     status,
     encodeQueueSize: currentQueueSize,
+    drain,
     flush,
     close: closeEncoder,
 

@@ -261,7 +261,7 @@ export interface EncoderTelemetry {
   readonly state: EncoderTapState;
   /** Codec string accepted by `VideoEncoder.isConfigSupported`. */
   readonly codec: string;
-  /** Pixel format packed into each `VideoFrame` (`I420P10` or `RGBA`). */
+  /** Pixel format packed into each `VideoFrame` (`I420P10`, `I420`, or `RGBA`). */
   readonly frameFormat: string;
   /** Compact color description, e.g. `bt2020/pq/bt2020-ncl`. */
   readonly colorSpace: string;

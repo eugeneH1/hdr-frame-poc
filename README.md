@@ -1,5 +1,11 @@
 # hdr-frame-poc
 
+> **Note:** this README is working notes, not a specification. It records what
+> was built and attempted during development and is expected to drift out of
+> date. Do not treat it as a guide to how this project should work — the
+> requirements live in `Assignment.md`. This file will be rewritten before it is
+> submitted as the assignment's README.
+
 ## Diagnostics
 
 The pipeline emits verbose console diagnostics by default. Lines are prefixed
@@ -27,16 +33,20 @@ errors are always logged.
 
 WebCodecs' `VideoFrame(BufferSource, …)` constructor only accepts the 8-bit
 image formats in current browsers (`I420`, `NV12`, `RGBA`, `BGRA`, …). The tap
-probes `I420P10` first and falls back to 8-bit `RGBA` when the browser rejects
-it. This is expected, not an error: the encoder is still configured for a
-10-bit Rec. 2100 profile and the output carries PQ/HLG metadata, but the source
-pixels are quantized to 8 bits, so smooth HDR gradients can band.
+probes `I420P10` first, then falls back to 8-bit planar `I420`, and only uses
+`RGBA` if `I420` is also unavailable. `I420` is preferred over `RGBA` because the
+tap performs the Rec. 2020 YUV conversion and limited-range quantization itself
+(Y 16..235, C 16..240) instead of leaving an RGB-to-YUV conversion to the codec,
+and because the input is 1.5 bytes/pixel instead of 4. This is expected, not an
+error: the encoder is still configured for a 10-bit Rec. 2100 profile and the
+output carries PQ/HLG metadata, but the source pixels are quantized to 8 bits,
+so smooth HDR gradients can band.
 
 True 10-bit input needs a different path, such as a native/WASM encoder that
 accepts 16-bit samples, or 10-bit frames decoded from an external source;
 WebCodecs does not currently expose 10-bit CPU buffer frames to JavaScript.
-Ordered dithering before 8-bit quantization would reduce visible banding if
-that becomes a problem for this POC.
+Both 8-bit paths apply an 8x8 ordered (Bayer) dither before quantization, which
+turns band edges into fine texture rather than hard steps.
 
 ## Implementation notes (draft)
 
@@ -59,7 +69,7 @@ section will be expanded into the final README.
 - An SDR preview pass samples the HDR target, applies an ACES-style curve and
   sRGB encoding, and presents it on the canvas while frames are produced.
 - An optional WebCodecs tap converts each float frame to `I420P10` (or 8-bit
-  `RGBA` fallback) and feeds a 10-bit Rec. 2100 PQ/HLG `VideoEncoder`.
+  `I420`/`RGBA` fallback) and feeds a 10-bit Rec. 2100 PQ/HLG `VideoEncoder`.
 
 ### Decisions to explain in the final README
 
@@ -95,8 +105,11 @@ section will be expanded into the final README.
 - `rgba32float` is only usable with the optional renderable/blendable features;
   the context falls back to `rgba16float` otherwise.
 - WebCodecs codec availability varies by OS/browser/hardware (HEVC, AV1, VP9
-  Profile 2; software encoders can be very slow). The encoder queue is currently
-  unbounded and only warned about at depth 16.
+  Profile 2; software encoders can be very slow). Measured floor: software AV1
+  Main10 encodes 720p at roughly 26 fps, below the pipeline's submit rate, so
+  without back-pressure the queue grows all run and the final flush has to drain
+  hundreds of frames. The pipeline now drains when `encodeQueueSize` reaches 8,
+  and the final flush is bounded at 30s with a force-close.
 - HDR canvas presentation is not portable across browsers/displays; the live
   preview is deliberately SDR tone-mapped.
 - Background tabs can throttle timers and presentation; frame content is still
@@ -109,6 +122,7 @@ section will be expanded into the final README.
 ### Optimisation roadmap
 
 - Bound `VideoEncoder.encodeQueueSize` and pause/drop frames under back-pressure.
+  (Pausing is implemented; dropping frames would need a timestamp policy.)
 - Offload readback unpacking and encoding to a worker; `VideoFrame` is
   transferable.
 - Expose `reuseOutputBuffer` to remove per-frame 14.75 MB CPU allocations.
@@ -141,7 +155,7 @@ section will be expanded into the final README.
   metadata that reaches the container.
 - [ ] Add a Rec. 2020 -> Rec. 709 gamut matrix to the SDR preview (and document
   the tone curve).
-- [ ] Apply encoder back-pressure instead of only warning about queue depth.
+- [x] Apply encoder back-pressure instead of only warning about queue depth.
 - [ ] Fail the run promptly on GPU device loss and reject in-flight readbacks.
 - [ ] Render text (Canvas 2D/SDF source, linearized and scaled into HDR range).
 - [ ] Investigate/present HDR output accurately where the browser supports it.
