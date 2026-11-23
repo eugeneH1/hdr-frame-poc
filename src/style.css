@@ -444,6 +444,17 @@ code {
   border-radius: 6px;
 }
 
+.wb-number {
+  font: inherit;
+  font-size: 14px;
+  padding: 8px 10px;
+  width: 92px;
+  color: var(--text-h);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
 .wb-button {
   font: inherit;
   font-size: 14px;

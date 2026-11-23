@@ -14,11 +14,15 @@
  *   `AbortSignal`; the workbench never touches GPU objects.
  * - Telemetry arrives already throttled by the pipeline; `updateTelemetry`
  *   merely formats it into stable DOM nodes.
+ * - The workbench registers `onFrame` to count streamed Float32 frames and keep
+ *   one user-selected frame (copied before the pipeline releases it) for `.npy`
+ *   download; it never retains all 300 frames.
  */
 
 import type {
   ColorSpaceSpec,
   EncoderTelemetry,
+  FloatFrame,
   FrameMeta,
   RenderConfig,
   TelemetrySnapshot,
@@ -78,6 +82,15 @@ interface StatCell {
   readonly value: HTMLElement;
 }
 
+/** One completed CPU frame copied out of the streaming pipeline for download. */
+interface RetainedFrame {
+  readonly frameIndex: number;
+  readonly width: number;
+  readonly height: number;
+  /** Copied out of the streaming pipeline, so this owns a regular ArrayBuffer. */
+  readonly pixels: Float32Array<ArrayBuffer>;
+}
+
 function createElement<K extends keyof HTMLElementTagNameMap>(
   tag: K,
   className?: string,
@@ -115,6 +128,70 @@ function formatFixed(value: number, digits = 3): string {
 
 function formatMegabytes(bytes: number): string {
   return (bytes / (1024 * 1024)).toFixed(1);
+}
+
+/** Formats cumulative streamed frame bytes using GB once past 1 GiB. */
+function formatStreamedBytes(bytes: number): string {
+  const megabytes = bytes / (1024 * 1024);
+  return megabytes >= 1024
+    ? `${(megabytes / 1024).toFixed(2)} GB`
+    : `${megabytes.toFixed(1)} MB`;
+}
+
+/**
+ * Deterministic FNV-1a checksum over the raw float bits. Used to prove that the
+ * frame delivered through `onFrame` is real Float32 data and to compare runs.
+ */
+function checksumFloats(values: Float32Array): string {
+  const words = new Uint32Array(values.buffer, values.byteOffset, values.length);
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < words.length; index++) {
+    hash ^= words[index];
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Builds a NumPy v1.0 `.npy` header for a C-order `(height, width, 4)` float32
+ * array. This lets the downloaded frame load directly with
+ * `numpy.load(path)` without any custom parser.
+ */
+function buildNpyHeader(width: number, height: number): Uint8Array<ArrayBuffer> {
+  const preambleLength = 10; // 6 magic + 2 version + 2 header length
+  const dict =
+    `{'descr': '<f4', 'fortran_order': False, 'shape': (${height}, ${width}, 4), }`;
+  // The format requires magic + version + length + header to be 64-byte aligned.
+  const padding = (64 - ((preambleLength + dict.length + 1) % 64)) % 64;
+  const headerText = `${dict}${' '.repeat(padding)}\n`;
+  const header = new Uint8Array(preambleLength + headerText.length);
+
+  header.set([0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59], 0); // \x93NUMPY
+  header[6] = 1; // major version
+  header[7] = 0; // minor version
+  header[8] = headerText.length & 0xff;
+  header[9] = (headerText.length >>> 8) & 0xff;
+  for (let index = 0; index < headerText.length; index++) {
+    header[preambleLength + index] = headerText.charCodeAt(index);
+  }
+  return header;
+}
+
+/** Downloads one retained frame as `(height, width, 4)` little-endian float32. */
+function downloadNpyFrame(frame: RetainedFrame): void {
+  const blob = new Blob([buildNpyHeader(frame.width, frame.height), frame.pixels], {
+    type: 'application/octet-stream',
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  const paddedIndex = String(frame.frameIndex).padStart(3, '0');
+  link.href = url;
+  link.download =
+    `hdr-frame-${paddedIndex}-${frame.width}x${frame.height}-rec2020-linear-rgba32f.npy`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 /** Rec. 2100 PQ delivery space used as the default output description. */
@@ -202,6 +279,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   let running = false;
   let unmounted = false;
   let activeController: AbortController | null = null;
+  let retainedFrame: RetainedFrame | null = null;
 
   // --- Header ----------------------------------------------------------------
   const container = createElement('div', 'workbench');
@@ -248,7 +326,34 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     createElement('span', 'wb-field-label', 'WebCodecs encode'),
   );
 
-  controls.append(formatField, encoderField, startButton, cancelButton);
+  const frameField = createElement('label', 'wb-field');
+  const frameIndexInput = document.createElement('input');
+  frameIndexInput.type = 'number';
+  frameIndexInput.className = 'wb-number';
+  frameIndexInput.min = '0';
+  frameIndexInput.max = String(DEFAULT_FRAME_COUNT - 1);
+  frameIndexInput.step = '1';
+  frameIndexInput.value = '0';
+  frameIndexInput.title = 'Frame copied out through onFrame for the .npy download';
+  frameField.append(
+    createElement('span', 'wb-field-label', 'Frame to keep'),
+    frameIndexInput,
+  );
+
+  const downloadButton = createElement('button', 'wb-button', 'Download frame');
+  downloadButton.type = 'button';
+  downloadButton.disabled = true;
+  downloadButton.title =
+    'Download the kept frame as .npy (H×W×4 float32, linear Rec.2020)';
+
+  controls.append(
+    formatField,
+    encoderField,
+    frameField,
+    startButton,
+    cancelButton,
+    downloadButton,
+  );
   header.append(headingGroup, stateBadge);
 
   // --- Preview stage ---------------------------------------------------------
@@ -260,7 +365,8 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
 
   // --- Telemetry -------------------------------------------------------------
   const stats = createElement('dl', 'wb-stats');
-  const frameStat = createStat('Frames');
+  const frameStat = createStat('Frames rendered');
+  const returnedStat = createStat('Frames returned');
   const elapsedStat = createStat('Elapsed');
   const timingStat = createStat('Frame time');
   const renderTimingStat = createStat('Render / preview');
@@ -270,12 +376,14 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   const sampleStat = createStat('Center pixel RGBA');
   const readbackStat = createStat('Readback');
   const targetStat = createStat('Active HDR target');
-  const retainedStat = createStat('Retained');
+  const retainedStat = createStat('Pipeline retained');
+  const keptFrameStat = createStat('Kept frame');
   const fpsStat = createStat('FPS');
   const encoderStat = createStat('VideoEncoder');
   const chunksStat = createStat('Encoded chunks');
   stats.append(
     frameStat.cell,
+    returnedStat.cell,
     elapsedStat.cell,
     timingStat.cell,
     renderTimingStat.cell,
@@ -286,6 +394,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     readbackStat.cell,
     targetStat.cell,
     retainedStat.cell,
+    keptFrameStat.cell,
     fpsStat.cell,
     encoderStat.cell,
     chunksStat.cell,
@@ -294,17 +403,25 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   const note = createElement(
     'p',
     'wb-note',
-    'Frames are streamed: each Float32 frame (~14.75 MB at 1280×720) is released after readback, ' +
-      'so a 300-frame run never retains all frames (~4.4 GB if it did). Enable WebCodecs encode ' +
-      'to pack each frame as I420P10 (RGBA fallback) and feed a Rec. 2100 PQ/HLG encoder; chunk ' +
-      'counts and bytes are tracked here, with muxing left to a future phase. 10-bit encoder input ' +
+    'Frames are streamed: each Float32 frame (~14.75 MB at 1280×720) is delivered through ' +
+      'onFrame and released afterwards; only the selected frame is copied for download, so a ' +
+      '300-frame run never retains all frames (~4.4 GB if it did). “Download frame” saves the ' +
+      'kept frame as .npy (H×W×4 float32, linear Rec.2020). Enable WebCodecs encode to pack ' +
+      'each frame as I420P10 (RGBA fallback) and feed a Rec. 2100 PQ/HLG encoder; chunk counts ' +
+      'and bytes are tracked here, with muxing left to a future phase. 10-bit encoder input ' +
       'requires the browser to expose I420P10 VideoFrames; otherwise the tap falls back to 8-bit RGBA.',
   );
+
+  // Expected capability fallbacks (currently the 8-bit RGBA input path) belong
+  // here rather than in the warning banner: they reduce precision but are not
+  // errors and cannot be avoided in current browser WebCodecs implementations.
+  const encoderNote = createElement('p', 'wb-note');
+  encoderNote.hidden = true;
 
   const warningEl = createElement('p', 'wb-warning');
   warningEl.hidden = true;
 
-  container.append(header, stage, controls, stats, note, warningEl);
+  container.append(header, stage, controls, stats, note, encoderNote, warningEl);
   root.replaceChildren(container);
 
   function setState(state: WorkbenchState, label: string): void {
@@ -315,6 +432,27 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   function showWarning(message: string): void {
     warningEl.hidden = message.length === 0;
     warningEl.textContent = message;
+  }
+
+  function clearRetainedFrame(): void {
+    retainedFrame = null;
+    keptFrameStat.value.textContent = '—';
+    downloadButton.disabled = true;
+  }
+
+  function onDownloadClick(): void {
+    if (!retainedFrame) return;
+    logInfo('workbench', 'Downloading retained frame', {
+      frameIndex: retainedFrame.frameIndex,
+      width: retainedFrame.width,
+      height: retainedFrame.height,
+      bytes: retainedFrame.pixels.byteLength,
+    });
+    downloadNpyFrame(retainedFrame);
+  }
+
+  function onFrameIndexChange(): void {
+    if (!running) clearRetainedFrame();
   }
 
   /**
@@ -412,6 +550,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     cancelButton.disabled = false;
     formatSelect.disabled = true;
     encoderToggle.disabled = true;
+    frameIndexInput.disabled = true;
     showWarning('');
     setState('running', 'Running');
 
@@ -428,6 +567,18 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     };
     const config = createConfig(selection);
     const wantEncoder = encoderToggle.checked && webCodecsAvailable;
+
+    const requestedKeepIndex = Number.parseInt(frameIndexInput.value, 10);
+    const keepFrameIndex = Number.isFinite(requestedKeepIndex)
+      ? Math.min(config.frameCount - 1, Math.max(0, Math.floor(requestedKeepIndex)))
+      : 0;
+    frameIndexInput.max = String(config.frameCount - 1);
+    frameIndexInput.value = String(keepFrameIndex);
+
+    let returnedFrames = 0;
+    let returnedBytes = 0;
+    clearRetainedFrame();
+    returnedStat.value.textContent = `0 / ${config.frameCount} · 0 MB`;
 
     logInfo('workbench', 'Starting run', {
       width: config.width,
@@ -448,6 +599,8 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     encoderStat.value.textContent = wantEncoder ? 'Starting…' : 'Off';
     chunksStat.value.textContent = '—';
     encodeTimingStat.value.textContent = '—';
+    encoderNote.hidden = true;
+    encoderNote.textContent = '';
 
     let encoderTap: VideoEncoderTap | null = null;
 
@@ -480,6 +633,10 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
                 // The encoder tap already logs to the console; keep the fallback
                 // reason available in the UI after later warnings replace it.
                 showWarning(`Video encoder: ${message}`);
+              },
+              onInfo: (message) => {
+                encoderNote.hidden = false;
+                encoderNote.textContent = message;
               },
               onError: (error) => {
                 showWarning(`Video encoder: ${error.message}`);
@@ -521,6 +678,34 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
         signal: controller.signal,
         encoderTap,
         callbacks: {
+          onFrame: (frame: FloatFrame) => {
+            returnedFrames++;
+            returnedBytes += frame.pixels.byteLength;
+            returnedStat.value.textContent =
+              `${returnedFrames} / ${config.frameCount} · ${formatStreamedBytes(returnedBytes)}`;
+
+            if (!retainedFrame && frame.meta.frameIndex === keepFrameIndex) {
+              // Copy now: the pipeline releases (or reuses) its payload as soon
+              // as this callback returns.
+              const pixels = frame.pixels.slice();
+              retainedFrame = {
+                frameIndex: frame.meta.frameIndex,
+                width: frame.meta.width,
+                height: frame.meta.height,
+                pixels,
+              };
+              const checksum = checksumFloats(pixels);
+              keptFrameStat.value.textContent = `#${frame.meta.frameIndex} · ${checksum}`;
+              downloadButton.disabled = false;
+              logInfo('workbench', 'Retained frame for download', {
+                frameIndex: frame.meta.frameIndex,
+                width: frame.meta.width,
+                height: frame.meta.height,
+                bytes: pixels.byteLength,
+                checksum,
+              });
+            }
+          },
           onTelemetry: updateTelemetry,
           onWarning: showWarning,
         },
@@ -529,9 +714,22 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       updateTelemetry(summary.telemetry);
       setState(summary.cancelled ? 'cancelled' : 'done', summary.cancelled ? 'Cancelled' : 'Complete');
 
+      if (summary.framesCompleted !== returnedFrames) {
+        logWarn('workbench', 'onFrame count does not match completed frames', {
+          onFrame: returnedFrames,
+          framesCompleted: summary.framesCompleted,
+        });
+      }
+      if (!retainedFrame) {
+        keptFrameStat.value.textContent = `#${keepFrameIndex} not delivered`;
+      }
+
       logInfo('workbench', summary.cancelled ? 'Run cancelled' : 'Run complete', {
         framesCompleted: summary.framesCompleted,
+        framesReturned: returnedFrames,
         framesTotal: config.frameCount,
+        streamedMiB: Number((returnedBytes / (1024 * 1024)).toFixed(1)),
+        keptFrameIndex: retainedFrame?.frameIndex ?? null,
         elapsedMs: Math.round(summary.elapsedMs),
         measuredFps: Number(summary.telemetry.measuredFps.toFixed(2)),
         warnings: summary.telemetry.warnings,
@@ -570,6 +768,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
         cancelButton.disabled = true;
         formatSelect.disabled = false;
         encoderToggle.disabled = !webCodecsAvailable;
+        frameIndexInput.disabled = false;
       }
     }
   }
@@ -593,6 +792,8 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     startButton.removeEventListener('click', onStartClick);
     cancelButton.removeEventListener('click', onCancelClick);
     encoderToggle.removeEventListener('change', onEncoderToggleChange);
+    downloadButton.removeEventListener('click', onDownloadClick);
+    frameIndexInput.removeEventListener('change', onFrameIndexChange);
     container.remove();
   }
 
@@ -605,12 +806,20 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   }
 
   function onEncoderToggleChange(): void {
-    if (!running) updateEncoderReadout(null, encoderToggle.checked);
+    if (!running) {
+      updateEncoderReadout(null, encoderToggle.checked);
+      if (!encoderToggle.checked) {
+        encoderNote.hidden = true;
+        encoderNote.textContent = '';
+      }
+    }
   }
 
   startButton.addEventListener('click', onStartClick);
   cancelButton.addEventListener('click', onCancelClick);
   encoderToggle.addEventListener('change', onEncoderToggleChange);
+  downloadButton.addEventListener('click', onDownloadClick);
+  frameIndexInput.addEventListener('change', onFrameIndexChange);
   updateEncoderReadout(null, false);
 
   if (!webgpuAvailable) {

@@ -15,10 +15,14 @@
  *   `VideoFrame` tag is the authoritative one. Unknown dictionary members are
  *   ignored by UAs that do not recognize them.
  * - **HDR packing:** the preferred input format is planar `I420P10` (limited
- *   range, 10-bit samples in the low bits of little-endian 16-bit words). If the
- *   UA rejects that format, the tap falls back to opaque 8-bit `RGBA`; that keeps
- *   the encoder path testable at reduced precision. No clamping happens before
- *   the transfer function, and the CPU pixels remain linear Rec. 2020.
+ *   range, 10-bit samples in the low bits of little-endian 16-bit words). The
+ *   WebCodecs `VideoFrame(BufferSource, ...)` constructor only accepts 8-bit
+ *   formats in current browsers (`I420`, `NV12`, `RGBA`, `BGRA`, ...), so the
+ *   tap probes `I420P10` and falls back to opaque 8-bit `RGBA`. That is an
+ *   expected capability fallback and is reported through `onInfo`, not
+ *   `onWarning`: encoding still works and the output keeps Rec. 2100 metadata.
+ *   No clamping happens before the transfer function, and the CPU pixels
+ *   remain linear Rec. 2020.
  * - **Orientation:** pixels are top-down in both `FloatFrame` and the packed
  *   planes. The tap never flips Y and writes `rotation: 0`, preserving the
  *   pipeline's existing orientation conventions.
@@ -95,6 +99,12 @@ export interface VideoEncoderTapOptions {
   readonly keyFrameIntervalFrames?: number;
   /** Non-fatal notices (unsupported profile, format fallback). */
   readonly onWarning?: (message: string) => void;
+  /**
+   * Expected capability notices that are not problems (e.g. the 8-bit RGBA
+   * input fallback). Hosts should surface these as informational text rather
+   * than warnings.
+   */
+  readonly onInfo?: (message: string) => void;
   /** Fatal encoder errors; the tap stops accepting frames afterwards. */
   readonly onError?: (error: Error) => void;
 }
@@ -592,6 +602,14 @@ export async function createVideoEncoderTap(
       // Diagnostics must never break the encode path.
     }
   };
+  const info = (message: string): void => {
+    logInfo('encoder', message);
+    try {
+      options.onInfo?.(message);
+    } catch {
+      // Diagnostics must never break the encode path.
+    }
+  };
   const failNotice = (error: unknown): void => {
     try {
       options.onError?.(error instanceof Error ? error : new Error(describeError(error)));
@@ -664,10 +682,10 @@ export async function createVideoEncoderTap(
         );
         return null;
       }
-      warn(
-        `I420P10 VideoFrames are unavailable in this UA (${probe.error ?? 'unsupported'}); ` +
-          'falling back to 8-bit RGBA input. HDR precision is reduced, but the encoder config ' +
-          'still carries Rec.2020 PQ/HLG metadata.',
+      info(
+        `This browser cannot construct 10-bit I420P10 VideoFrames from CPU buffers ` +
+          `(${probe.error ?? 'format unsupported'}); using 8-bit RGBA input instead. ` +
+          'The encoder still targets Rec.2020 PQ/HLG, but source precision is 8-bit.',
       );
       frameFormat = 'RGBA';
     }
