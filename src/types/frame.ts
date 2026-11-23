@@ -354,7 +354,7 @@ export interface TelemetrySnapshot {
   readonly lastFrameMs: number;
   /** Rolling average frame production time in milliseconds. */
   readonly averageFrameMs: number;
-  /** Bytes transferred from GPU to CPU since the run started. */
+  /** Bytes copied from GPU texture to CPU staging buffers (padded rows) since run start. */
   readonly readbackBytes: number;
   /** Estimated bytes currently retained in memory for buffered frames. */
   readonly retainedBytes: number;

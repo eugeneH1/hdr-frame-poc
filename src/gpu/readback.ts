@@ -44,7 +44,7 @@ import { GpuBufferUsage, GpuMapMode } from './webgpuFlags.ts';
 import { logDebug, logError, logInfo } from '../diagnostics/logger.ts';
 
 /** Default number of staging buffers kept in the ring. */
-const DEFAULT_STAGING_BUFFER_COUNT = 3;
+const DEFAULT_STAGING_BUFFER_COUNT = 4;
 /** Upper bound to keep accidental option values from allocating unbounded memory. */
 const MAX_STAGING_BUFFER_COUNT = 8;
 /** WebGPU `copyTextureToBuffer` row alignment requirement. */

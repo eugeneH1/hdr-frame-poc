@@ -398,7 +398,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   const encodeTimingStat = createStat('Encode (tap)');
   const peakStat = createStat('Peak (sampled)');
   const sampleStat = createStat('Center pixel RGBA');
-  const readbackStat = createStat('Readback');
+  const readbackStat = createStat('GPU readback');
   const targetStat = createStat('Active HDR target');
   const retainedStat = createStat('Pipeline retained');
   const keptFrameStat = createStat('Kept frame');

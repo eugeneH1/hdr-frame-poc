@@ -109,10 +109,13 @@ section will be expanded into the final README.
 - `rgba32float` is only usable with the optional renderable/blendable features;
   the context falls back to `rgba16float` otherwise.
 - WebCodecs codec availability varies by OS/browser/hardware (HEVC, AV1, VP9
-  Profile 2; software encoders can be very slow). The pipeline pauses before
-  submitting a frame once `encodeQueueSize` reaches 8, waiting for a
-  `VideoEncoder.flush()` to drain the queue. The final flush is bounded at 30s
-  and force-closes a wedged encoder so a run cannot hang indefinitely.
+  Profile 2; software encoders can be very slow). Hardware encoders naturally
+  buffer multiple frames for lookahead and rate control; the pipeline applies
+  back-pressure when `encodeQueueSize` reaches 64, waiting for WebCodecs
+  `dequeue` events until the queue drops to 32 rather than calling an expensive
+  `VideoEncoder.flush()` mid-run. This prevents pipeline stuttering while still
+  bounding memory usage during long exports. The final flush is bounded at 30s and
+  force-closes a wedged encoder so a run cannot hang indefinitely.
 - If the browser exposes no supported 10-bit encoder profile, no chunks are
   produced and no video can be downloaded; the frame pipeline still completes.
 - Muxing writes container colour tags (`colr`/`Colour`) but not mastering-display

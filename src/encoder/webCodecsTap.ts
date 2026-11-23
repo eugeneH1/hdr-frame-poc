@@ -39,6 +39,7 @@ import type {
   FloatFrame,
   FrameMeta,
 } from '../types/frame.ts';
+import { clamp01 } from '../timeline/easing.ts';
 
 import { logDebug, logError, logInfo, logWarn } from '../diagnostics/logger.ts';
 
@@ -62,12 +63,11 @@ export interface VideoEncoderTap {
   /** Frames still held by the encoder's internal queue (backpressure signal). */
   encodeQueueSize(): number;
   /**
-   * Waits for the encoder to process everything queued so far without closing
-   * it. The tap stays configured afterwards, so callers can use this to apply
-   * back-pressure mid-run. Resolves immediately when the queue is empty, and is
-   * a no-op after close or a fatal error.
+   * Waits for the encoder's internal queue to drop below `targetQueueSize`
+   * using the WebCodecs `dequeue` event instead of an expensive full flush.
+   * Keeps the hardware encoder pipeline warm while preventing runaway memory.
    */
-  drain(): Promise<void>;
+  drain(targetQueueSize?: number): Promise<void>;
   /**
    * Converts and submits one frame. Returns `false` when the tap is closed,
    * errored, or the frame was rejected. The intermediate `VideoFrame` is always
@@ -166,6 +166,7 @@ const HLG_LUMA_SCALE = REFERENCE_WHITE_NITS / HLG_PEAK_NITS;
 const MAX_ENCODED_LINEAR = 16;
 /** Lookup table resolution; sampled in sqrt(linear) space for shadow accuracy. */
 const TRANSFER_LUT_SIZE = 4096;
+const LUT_INDEX_SCALE = (TRANSFER_LUT_SIZE - 1) / Math.sqrt(MAX_ENCODED_LINEAR);
 
 /** BT.2020 non-constant-luminance luma coefficients. */
 const Y_R = 0.2627;
@@ -176,11 +177,8 @@ const CR_DIVISOR = 1.4746;
 
 let pqLut: Float32Array | null = null;
 let hlgLut: Float32Array | null = null;
-
-function clamp01(value: number): number {
-  if (!(value > 0)) return 0;
-  return value < 1 ? value : 1;
-}
+let pqLutU8: Uint8Array | null = null;
+let hlgLutU8: Uint8Array | null = null;
 
 /** SMPTE ST 2084 (PQ) OETF; input is normalized absolute luminance / 10000. */
 function encodePq(normalizedLuminance: number): number {
@@ -226,15 +224,35 @@ function getTransferLut(transfer: 'pq' | 'hlg'): Float32Array {
   return hlgLut;
 }
 
+function getTransferLutU8(transfer: 'pq' | 'hlg'): Uint8Array {
+  if (transfer === 'pq') {
+    if (!pqLutU8) {
+      const f32 = getTransferLut('pq');
+      pqLutU8 = new Uint8Array(TRANSFER_LUT_SIZE);
+      for (let i = 0; i < TRANSFER_LUT_SIZE; i++) {
+        pqLutU8[i] = Math.round(clamp01(f32[i]) * 255);
+      }
+    }
+    return pqLutU8;
+  }
+  if (!hlgLutU8) {
+    const f32 = getTransferLut('hlg');
+    hlgLutU8 = new Uint8Array(TRANSFER_LUT_SIZE);
+    for (let i = 0; i < TRANSFER_LUT_SIZE; i++) {
+      hlgLutU8[i] = Math.round(clamp01(f32[i]) * 255);
+    }
+  }
+  return hlgLutU8;
+}
+
 /**
  * Samples the nonlinear transfer LUT. The index is `sqrt(linear)`, which spends
  * most of the table on the perceptually important shadow range.
  */
 function encodeTransfer(linear: number, lut: Float32Array): number {
   if (!(linear > 0)) return 0;
-  const u = Math.sqrt(linear / MAX_ENCODED_LINEAR);
-  if (u >= 1) return lut[TRANSFER_LUT_SIZE - 1];
-  const scaled = u * (TRANSFER_LUT_SIZE - 1);
+  const scaled = Math.sqrt(linear) * LUT_INDEX_SCALE;
+  if (scaled >= TRANSFER_LUT_SIZE - 1) return lut[TRANSFER_LUT_SIZE - 1];
   const index = scaled | 0;
   const fraction = scaled - index;
   const low = lut[index];
@@ -300,6 +318,7 @@ function packI420P10(
         }
       }
 
+      if (samples === 0) continue;
       const chromaIndex = (y >> 1) * chromaWidth + (x >> 1);
       output[uPlane + chromaIndex] = quantizeChroma(cbSum / samples);
       output[vPlane + chromaIndex] = quantizeChroma(crSum / samples);
@@ -315,16 +334,23 @@ function packRgba8(
   transfer: 'pq' | 'hlg',
   output: Uint8Array,
 ): void {
-  const lut = getTransferLut(transfer);
-  const pixelCount = width * height;
+  const lutU8 = getTransferLutU8(transfer);
+  const total = width * height * 4;
+  const maxIndex = TRANSFER_LUT_SIZE - 1;
 
-  for (let pixel = 0; pixel < pixelCount; pixel++) {
-    const source = pixel * 4;
-    const target = source;
-    output[target] = Math.round(encodeTransfer(pixels[source], lut) * 255);
-    output[target + 1] = Math.round(encodeTransfer(pixels[source + 1], lut) * 255);
-    output[target + 2] = Math.round(encodeTransfer(pixels[source + 2], lut) * 255);
-    output[target + 3] = 255;
+  for (let i = 0; i < total; i += 4) {
+    const r = pixels[i];
+    const g = pixels[i + 1];
+    const b = pixels[i + 2];
+
+    const idxR = r > 0 ? (Math.sqrt(r) * LUT_INDEX_SCALE + 0.5) | 0 : 0;
+    const idxG = g > 0 ? (Math.sqrt(g) * LUT_INDEX_SCALE + 0.5) | 0 : 0;
+    const idxB = b > 0 ? (Math.sqrt(b) * LUT_INDEX_SCALE + 0.5) | 0 : 0;
+
+    output[i] = lutU8[idxR < maxIndex ? idxR : maxIndex];
+    output[i + 1] = lutU8[idxG < maxIndex ? idxG : maxIndex];
+    output[i + 2] = lutU8[idxB < maxIndex ? idxB : maxIndex];
+    output[i + 3] = 255;
   }
 }
 
@@ -835,22 +861,37 @@ export async function createVideoEncoderTap(
     };
   }
 
-  async function drain(): Promise<void> {
+  async function drain(targetQueueSize: number = 4): Promise<void> {
     if (closed || failed) return;
     const queued = currentQueueSize();
-    if (queued === 0) return;
-    logDebug('encoder', 'Draining encoder queue', {
+    if (queued <= targetQueueSize) return;
+    logDebug('encoder', 'Draining encoder queue to target', {
       encodeQueueSize: queued,
+      targetQueueSize,
       framesSubmitted,
       chunksEmitted,
     });
-    try {
-      // `VideoEncoder.flush()` emits everything queued but leaves the encoder
-      // configured, which is exactly the back-pressure we need mid-run.
-      await encoder.flush();
-    } catch (error) {
-      reportError(error, true);
-    }
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        encoder.removeEventListener('dequeue', onDequeue);
+        clearTimeout(timer);
+        resolve();
+      };
+
+      const onDequeue = () => {
+        if (currentQueueSize() <= targetQueueSize || closed || failed) {
+          cleanup();
+        }
+      };
+
+      encoder.addEventListener('dequeue', onDequeue);
+
+      // Fallback timer in case dequeue is delayed or dropped by the platform
+      const timer = setTimeout(cleanup, 250);
+    });
   }
 
   function flush(): Promise<void> {

@@ -60,20 +60,22 @@ const STATS_PIXEL_STRIDE = 16;
 const FPS_WINDOW_SIZE = 30;
 /** Maximum warnings retained in a telemetry snapshot. */
 const MAX_WARNINGS = 5;
-/** Default readback lookahead: one GPU copy overlapping one CPU unpack. */
-const DEFAULT_MAX_FRAMES_IN_FLIGHT = 2;
+/** Default readback lookahead: staging copies overlapping CPU unpack. */
+const DEFAULT_MAX_FRAMES_IN_FLIGHT = 3;
 /** How often an await that should be quick logs its diagnostic state. */
 const STALL_LOG_INTERVAL_MS = 5000;
 /** Encoder queue depth at which the pipeline reports encoding back-pressure. */
-const ENCODER_QUEUE_WARN_THRESHOLD = 16;
+const ENCODER_QUEUE_WARN_THRESHOLD = 48;
 /** Minimum gap between encoder back-pressure warnings. */
 const ENCODER_QUEUE_WARN_INTERVAL_MS = 2000;
 /**
  * Encoder queue depth at which the pipeline pauses before submitting another
- * frame and waits for the encoder to drain. Without this the queue grows for the
- * whole run and the final flush has to encode the entire backlog.
+ * frame and waits for the encoder to catch up. Set with ample headroom (64)
+ * so normal runs never stutter while still bounding memory on long jobs.
  */
-const ENCODER_QUEUE_DRAIN_THRESHOLD = 8;
+const ENCODER_QUEUE_DRAIN_THRESHOLD = 64;
+/** Target queue depth before resuming submission after back-pressure. */
+const ENCODER_QUEUE_RESUME_THRESHOLD = 32;
 /** Upper bound on the final flush; a wedged encoder is force-closed after this. */
 const ENCODER_FLUSH_TIMEOUT_MS = 30_000;
 
@@ -286,6 +288,7 @@ export async function runFramePipeline(
     unpackMs: 0,
     encodeMs: 0,
     consumerMs: 0,
+    totalMs: 0,
   };
 
   function addWarning(message: string): void {
@@ -489,9 +492,11 @@ export async function runFramePipeline(
     timingTotals.unpackMs += breakdown.unpackMs;
     timingTotals.encodeMs += breakdown.encodeMs;
     timingTotals.consumerMs += breakdown.consumerMs;
+    timingTotals.totalMs += breakdown.totalMs;
 
     if (framesCompleted > 0) {
       const n = framesCompleted;
+      averageFrameMs = timingTotals.totalMs / n;
       averageFrameTimings = {
         renderMs: timingTotals.renderMs / n,
         previewMs: timingTotals.previewMs / n,
@@ -499,8 +504,6 @@ export async function runFramePipeline(
         unpackMs: timingTotals.unpackMs / n,
         encodeMs: timingTotals.encodeMs / n,
         consumerMs: timingTotals.consumerMs / n,
-        // `totalMs` is wall-clock per delivered frame rather than the sum of
-        // overlapping per-frame spans, so it stays comparable to the FPS cell.
         totalMs: averageFrameMs,
       };
     }
@@ -565,12 +568,16 @@ export async function runFramePipeline(
         if (queued >= ENCODER_QUEUE_DRAIN_THRESHOLD) {
           currentStage = `frame ${item.frameIndex} encoder-drain`;
           const drainStart = performance.now();
-          logDebug('pipeline', 'Encoder back-pressure: draining before submit', {
+          logDebug('pipeline', 'Encoder back-pressure: waiting for queue to drain', {
             frameIndex: item.frameIndex,
             encodeQueueSize: queued,
+            targetQueueSize: ENCODER_QUEUE_RESUME_THRESHOLD,
             framesCompleted,
           });
-          await watchForStall(encoder.drain(), 'VideoEncoder back-pressure drain');
+          await watchForStall(
+            encoder.drain(ENCODER_QUEUE_RESUME_THRESHOLD),
+            'VideoEncoder back-pressure drain',
+          );
           encodeMs += performance.now() - drainStart;
         }
 
@@ -639,7 +646,6 @@ export async function runFramePipeline(
 
       const totalMs = performance.now() - item.startedAt;
       lastFrameMs = totalMs;
-      averageFrameMs = (performance.now() - runStart) / framesCompleted;
 
       recordTimings({
         renderMs: item.renderMs,
@@ -651,22 +657,28 @@ export async function runFramePipeline(
         totalMs,
       });
 
-      logDebug(
-        'pipeline',
-        `frame ${item.frameIndex} delivered (${framesCompleted}/${config.frameCount})`,
-        {
-          stagingBufferIndex: readback?.stagingBufferIndex,
-          mapWaitMs: Number(readbackMs.toFixed(2)),
-          unpackMs: Number(unpackMs.toFixed(2)),
-          encodeMs: Number(encodeMs.toFixed(2)),
-          consumerMs: Number(consumerMs.toFixed(2)),
-          totalMs: Number(totalMs.toFixed(2)),
-          measuredFps: Number(measuredFps.toFixed(2)),
-          encoderQueueSize: encoderQueueSize() ?? 'n/a',
-          pendingReadbacks: pending.length,
-          deviceLost: deviceLostReason ?? 'no',
-        },
-      );
+      if (
+        item.frameIndex === 0 ||
+        item.frameIndex === config.frameCount - 1 ||
+        item.frameIndex % 30 === 0
+      ) {
+        logDebug(
+          'pipeline',
+          `frame ${item.frameIndex} delivered (${framesCompleted}/${config.frameCount})`,
+          {
+            stagingBufferIndex: readback?.stagingBufferIndex,
+            mapWaitMs: Number(readbackMs.toFixed(2)),
+            unpackMs: Number(unpackMs.toFixed(2)),
+            encodeMs: Number(encodeMs.toFixed(2)),
+            consumerMs: Number(consumerMs.toFixed(2)),
+            totalMs: Number(totalMs.toFixed(2)),
+            measuredFps: Number(measuredFps.toFixed(2)),
+            encoderQueueSize: encoderQueueSize() ?? 'n/a',
+            pendingReadbacks: pending.length,
+            deviceLost: deviceLostReason ?? 'no',
+          },
+        );
+      }
 
       currentStage = `frame ${item.frameIndex} telemetry`;
       emitTelemetry(item.frameIndex === 0);
@@ -778,13 +790,20 @@ export async function runFramePipeline(
         break;
       }
 
-      logDebug('pipeline', `frame ${frameIndex} begin`, {
-        pendingReadbacks: pending.length,
-        framesCompleted,
-        encoderQueueSize: encoderQueueSize() ?? 'n/a',
-        deviceLost: deviceLostReason ?? 'no',
-        runElapsedMs: Math.round(performance.now() - runStart),
-      });
+      const isMilestone =
+        frameIndex === 0 ||
+        frameIndex === config.frameCount - 1 ||
+        frameIndex % 30 === 0;
+
+      if (isMilestone) {
+        logDebug('pipeline', `frame ${frameIndex} begin`, {
+          pendingReadbacks: pending.length,
+          framesCompleted,
+          encoderQueueSize: encoderQueueSize() ?? 'n/a',
+          deviceLost: deviceLostReason ?? 'no',
+          runElapsedMs: Math.round(performance.now() - runStart),
+        });
+      }
 
       // Bounded lookahead: deliver the oldest frame before starting another.
       if (pending.length >= maxFramesInFlight) {
@@ -849,12 +868,14 @@ export async function runFramePipeline(
         previewMs,
       });
 
-      logDebug('pipeline', `frame ${frameIndex} submitted`, {
-        renderMs: Number((beforePreview - frameStart + submitMs).toFixed(2)),
-        previewMs: Number(previewMs.toFixed(2)),
-        stagingBufferIndex: job.stagingBufferIndex,
-        pendingReadbacks: pending.length,
-      });
+      if (isMilestone) {
+        logDebug('pipeline', `frame ${frameIndex} submitted`, {
+          renderMs: Number((beforePreview - frameStart + submitMs).toFixed(2)),
+          previewMs: Number(previewMs.toFixed(2)),
+          stagingBufferIndex: job.stagingBufferIndex,
+          pendingReadbacks: pending.length,
+        });
+      }
     }
 
     cancelled = cancelled || (signal?.aborted ?? false);
@@ -985,4 +1006,5 @@ interface MutableTimings {
   unpackMs: number;
   encodeMs: number;
   consumerMs: number;
+  totalMs: number;
 }
