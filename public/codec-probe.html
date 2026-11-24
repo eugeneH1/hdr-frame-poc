@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>WebCodecs codec probe</title>
+    <style>
+      body { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 24px; }
+      h1 { font: 600 16px system-ui, sans-serif; }
+      table { border-collapse: collapse; margin-top: 12px; }
+      td, th { border: 1px solid #ccc; padding: 4px 8px; text-align: left; vertical-align: top; }
+      .ok { color: #060; font-weight: 600; }
+      .no { color: #a00; }
+      .note { color: #555; font-family: system-ui, sans-serif; max-width: 70ch; }
+    </style>
+  </head>
+  <body>
+    <h1>WebCodecs encoder codec probe</h1>
+    <p class="note">
+      Standalone diagnostic. It probes the same codec strings the POC uses, with
+      and without the non-standard <code>colorSpace</code> member, so we can tell
+      whether the HDR tagging or the codec/profile itself is being rejected.
+      Results also go to the console.
+    </p>
+    <div id="out">Probing…</div>
+    <script type="module">
+      const CODECS = [
+        'hvc1.2.4.L93.B0',
+        'av01.0.08M.10',
+        'vp09.02.31.10',
+        'avc1.640028',
+      ];
+      const BASE = { width: 1280, height: 720, bitrate: 8_294_483, framerate: 30 };
+      const HDR_CS = { primaries: 'bt2020', transfer: 'pq', matrix: 'bt2020-ncl', fullRange: false };
+
+      const rows = [];
+      async function probe(label, config) {
+        let supported = false;
+        let error = '';
+        try {
+          const r = await VideoEncoder.isConfigSupported(config);
+          supported = Boolean(r.supported);
+        } catch (e) {
+          error = e && e.message ? e.message : String(e);
+        }
+        rows.push({ label, config, supported, error });
+        return supported;
+      }
+
+      for (const codec of CODECS) {
+        await probe(`${codec} · bare`, { ...BASE, codec });
+        await probe(`${codec} · +colorSpace`, { ...BASE, codec, colorSpace: HDR_CS });
+        await probe(`${codec} · prefer-software`, {
+          ...BASE, codec, hardwareAcceleration: 'prefer-software',
+        });
+        await probe(`${codec} · latency realtime`, {
+          ...BASE, codec, latencyMode: 'realtime',
+        });
+      }
+
+      // Also confirm the primitives exist at all.
+      const api = {
+        VideoEncoder: typeof VideoEncoder !== 'undefined',
+        VideoFrame: typeof VideoFrame !== 'undefined',
+        isConfigSupported: typeof VideoEncoder?.isConfigSupported === 'function',
+      };
+
+      const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+      const html = [
+        `<pre>${esc(JSON.stringify(api, null, 2))}</pre>`,
+        '<table><thead><tr><th>probe</th><th>supported</th><th>error</th></tr></thead><tbody>',
+        ...rows.map(
+          (r) =>
+            `<tr><td>${esc(r.label)}</td><td class="${r.supported ? 'ok' : 'no'}">${r.supported}</td><td>${esc(r.error)}</td></tr>`,
+        ),
+        '</tbody></table>',
+      ].join('');
+      document.getElementById('out').innerHTML = html;
+
+      console.table(rows.map(({ label, supported, error }) => ({ label, supported, error })));
+      console.log('WebCodecs primitives:', api);
+      console.log('Full rows:', rows);
+    </script>
+  </body>
+</html>

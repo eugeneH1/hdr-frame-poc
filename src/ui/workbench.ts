@@ -31,8 +31,8 @@ import { getWorkingColorSpace } from '../timeline/sceneAnimator.ts';
 import { runFramePipeline } from '../pipeline/framePipeline.ts';
 import { createVideoEncoderTap, flushAndClose } from '../encoder/webCodecsTap.ts';
 import type { VideoEncoderTap } from '../encoder/webCodecsTap.ts';
-import { muxVideoToMp4, canMuxCodec } from '../encoder/mp4Muxer.ts';
-import type { MuxedVideo, MuxVideoChunk } from '../encoder/mp4Muxer.ts';
+import { canMuxVideo, muxVideo } from '../encoder/videoContainer.ts';
+import type { MuxedVideoFile, MuxVideoChunk } from '../encoder/videoContainer.ts';
 import { describeLogging, logDebug, logError, logInfo, logWarn } from '../diagnostics/logger.ts';
 
 const DEFAULT_WIDTH = 1280;
@@ -43,11 +43,16 @@ const DEFAULT_FRAME_COUNT = 300;
 /**
  * Codecs the export pass is allowed to select, in preference order.
  *
- * Constrained deliberately: encoding with a codec the MP4 muxer cannot carry
- * (notably VP9, which Firefox may prefer) wastes a full encode pass and then
- * fails at the container step. HEVC and AV1 both map cleanly onto MP4.
+ * Constrained deliberately: encoding with a codec no muxer can carry wastes a
+ * full encode pass and then fails at the container step. HEVC and AV1 go into
+ * MP4; VP9 goes into WebM. H.264 is excluded because the export is HDR and
+ * 8-bit AVC cannot carry PQ.
  */
-const EXPORT_CODEC_CANDIDATES = ['hvc1.2.4.L93.B0', 'av01.0.08M.10'] as const;
+const EXPORT_CODEC_CANDIDATES = [
+  'hvc1.2.4.L93.B0',
+  'av01.0.08M.10',
+  'vp09.02.31.10',
+] as const;
 
 /** Fixed run parameters plus the user-selectable HDR target format. */
 export interface WorkbenchRunOptions {
@@ -214,7 +219,7 @@ function downloadNpyFrame(frame: RetainedFrame): void {
  * The filename records the container, codec family, and transfer function,
  * because those three facts are what determine whether a player shows it as HDR.
  */
-function downloadMuxedVideo(video: MuxedVideo, transfer: 'pq' | 'hlg', url?: string): void {
+function downloadMuxedVideo(video: MuxedVideoFile, transfer: 'pq' | 'hlg', url?: string): void {
   const objectUrl = url ?? URL.createObjectURL(new Blob([video.buffer], { type: video.mimeType }));
   const link = document.createElement('a');
   link.href = objectUrl;
@@ -312,7 +317,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   let unmounted = false;
   let activeController: AbortController | null = null;
   let retainedFrame: RetainedFrame | null = null;
-  let muxedVideo: MuxedVideo | null = null;
+  let muxedVideo: MuxedVideoFile | null = null;
   let muxedTransfer: 'pq' | 'hlg' = 'pq';
   let videoObjectUrl: string | null = null;
 
@@ -604,13 +609,14 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       // Backstop: even with a constrained candidate list, never start a full
       // encode pass whose output the muxer cannot carry. Failing here keeps the
       // error attributable to codec selection rather than the container writer.
-      if (!canMuxCodec(tap.codec)) {
+      if (!canMuxVideo(tap.codec)) {
         logWarn('workbench', 'Export codec cannot be muxed; aborting before encode', {
           codec: tap.codec,
         });
         showWarning(
-          `The selected encoder (${tap.codec}) cannot be written to MP4. ` +
-            'Export requires HEVC or AV1; see the console “Codec probe results” log.',
+          `The selected encoder (${tap.codec}) cannot be written to a container. ` +
+            'Export requires AV1/HEVC (MP4) or VP9 (WebM); see the console ' +
+            '“Codec probe results” log.',
         );
         setState('error', 'Unsupported');
         updateEncoderReadout(tap.status(), true);
@@ -656,7 +662,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
         // Muxing is synchronous and cheap (~a few MB of memcpy), and it needs the
         // whole chunk list, so it runs after the encode pass finishes.
         try {
-          const produced = muxVideoToMp4({
+          const produced = muxVideo({
             chunks: videoChunks,
             codec: tap.codec,
             width: config.width,
