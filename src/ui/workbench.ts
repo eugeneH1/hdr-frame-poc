@@ -35,7 +35,7 @@ import { createVideoEncoderTap, flushAndClose } from '../encoder/webCodecsTap.ts
 import type { VideoEncoderTap } from '../encoder/webCodecsTap.ts';
 import { canMuxVideo, muxVideo } from '../encoder/videoContainer.ts';
 import type { MuxedVideoFile, MuxVideoChunk } from '../encoder/videoContainer.ts';
-import { renderComparisonFrame } from '../encoder/videoComparison.ts';
+import { renderComparisonFrame, comparisonTimestampSeconds } from '../encoder/videoComparison.ts';
 import { computeChunkTiming } from '../encoder/chunkTiming.ts';
 import { describeLogging, logDebug, logError, logInfo, logWarn } from '../diagnostics/logger.ts';
 
@@ -379,6 +379,8 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   let videoObjectUrl: string | null = null;
   let muxedBlob: Blob | null = null;
   let showingComparison = false;
+  /** Frame currently on screen from the comparison canvas; null when hidden. */
+  let comparisonFrameIndex: number | null = null;
 
   // --- Header ----------------------------------------------------------------
   const container = createElement('div', 'workbench');
@@ -480,8 +482,9 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   compareButton.type = 'button';
   compareButton.disabled = true;
   compareButton.title =
-    'Show the exported frame tone-mapped with the preview\'s own ACES + sRGB curve, ' +
-    'so the two are directly comparable (raw PQ looks far too dark on an SDR display)';
+    'Show the frame selected in “Frame to keep”, decoded from the export and tone-mapped ' +
+    'with the preview\'s own ACES + sRGB curve (raw PQ looks far too dark on an SDR display). ' +
+    'Toggling back seeks the player to the same frame.';
 
   controls.append(
     formatField,
@@ -781,6 +784,97 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   }
 
   /**
+   * Waits for a media event, but never longer than `timeoutMs`.
+   *
+   * A `<video>` with a bad source emits `error` rather than the event we want, and
+   * some browsers never fire `seeked` for an unseekable stream. Resolving on
+   * timeout keeps the UI responsive in both cases; the caller can still inspect
+   * `currentTime`/`readyState` afterwards.
+   */
+  function waitForMediaEvent(
+    video: HTMLVideoElement,
+    event: 'loadedmetadata' | 'seeked',
+    timeoutMs = 2000,
+  ): Promise<void> {
+    return new Promise((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const done = (): void => {
+        if (timer !== null) clearTimeout(timer);
+        video.removeEventListener(event, done);
+        video.removeEventListener('error', done);
+        resolve();
+      };
+      timer = setTimeout(done, timeoutMs);
+      video.addEventListener(event, done, { once: true });
+      video.addEventListener('error', done, { once: true });
+    });
+  }
+
+  /**
+   * Puts the on-page player on exactly the frame the comparison canvas decoded.
+   *
+   * This is the whole point of the toggle: both views must show the same frame,
+   * so "raw PQ" is a transfer-function comparison rather than a comparison
+   * between frame N and whatever position the player happened to be at (0 s on a
+   * fresh export). The seek target comes from `comparisonTimestampSeconds`, the
+   * same helper the offscreen decode uses.
+   */
+  async function seekPreviewToFrame(frameIndex: number): Promise<void> {
+    const video = videoPreview;
+    const frameCount = muxedVideo?.frameCount ?? DEFAULT_FRAME_COUNT;
+    const targetSeconds = comparisonTimestampSeconds(frameIndex, frameCount, DEFAULT_FPS);
+
+    // A preview run detaches the player's src to release its decoder. If the
+    // user then compares the previous export, reattach the same blob so the
+    // toggle has something to reveal.
+    if (!video.hasAttribute('src') && videoObjectUrl) {
+      video.src = videoObjectUrl;
+    }
+
+    // Pause before seeking so playback cannot advance out from under the seek.
+    video.pause();
+
+    // HAVE_METADATA === 1; `duration` and a usable timeline need at least this.
+    if (video.readyState < 1) {
+      await waitForMediaEvent(video, 'loadedmetadata');
+    }
+
+    const duration = Number.isFinite(video.duration) ? video.duration : targetSeconds;
+    const target = Math.min(targetSeconds, Math.max(duration - 1e-3, 0));
+    if (Math.abs(video.currentTime - target) > 1e-3) {
+      const seeked = waitForMediaEvent(video, 'seeked');
+      video.currentTime = target;
+      await seeked;
+    }
+
+    logInfo('workbench', 'Seeked raw player to compared frame', {
+      frameIndex,
+      targetSeconds: Number(target.toFixed(4)),
+      durationSeconds: Number.isFinite(video.duration)
+        ? Number(video.duration.toFixed(4))
+        : null,
+      currentTime: Number.isFinite(video.currentTime)
+        ? Number(video.currentTime.toFixed(4))
+        : null,
+    });
+  }
+
+  /**
+   * Drops any comparison view and restores the default button state.
+   *
+   * Called when the stage is about to be reused (new run or new export). Without
+   * this, a comparison canvas can remain visible on top of the live preview, and
+   * the button keeps a `showingComparison` state pointing at a file that no longer
+   * exists.
+   */
+  function resetComparisonView(): void {
+    showingComparison = false;
+    comparisonFrameIndex = null;
+    comparisonCanvas.hidden = true;
+    compareButton.textContent = 'Compare like preview';
+  }
+
+  /**
    * Renders the exported frame through the preview's own tone curve so the two
    * images are comparable. Toggles back to the raw player on a second press.
    */
@@ -788,15 +882,39 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     if (!muxedVideo || !muxedBlob) return;
 
     if (showingComparison) {
-      showingComparison = false;
-      comparisonCanvas.hidden = true;
-      videoPreview.hidden = false;
-      compareButton.textContent = 'Compare like preview';
+      // Seek the visible player to the compared frame *before* revealing it, so
+      // the toggle never flashes frame 0 on its way to the right time.
+      const compared = comparisonFrameIndex;
+      compareButton.disabled = true;
+      compareButton.textContent = 'Seeking…';
+      try {
+        if (compared !== null) await seekPreviewToFrame(compared);
+        showingComparison = false;
+        comparisonFrameIndex = null;
+        comparisonCanvas.hidden = true;
+        videoPreview.hidden = false;
+        compareButton.textContent = 'Compare like preview';
+      } catch (error) {
+        logError('workbench', 'Seeking raw player to compared frame failed', error);
+        showWarning(`Could not seek the player: ${describeError(error)}`);
+        // Still reveal the player; leaving the comparison canvas up with a
+        // "Show raw PQ" label would be the more confusing state.
+        showingComparison = false;
+        comparisonFrameIndex = null;
+        comparisonCanvas.hidden = true;
+        videoPreview.hidden = false;
+        compareButton.textContent = 'Compare like preview';
+      } finally {
+        compareButton.disabled = false;
+      }
       return;
     }
 
     compareButton.disabled = true;
     compareButton.textContent = 'Comparing…';
+    // Freeze the player while it is hidden, so its position cannot drift away
+    // from the frame being decoded.
+    videoPreview.pause();
     try {
       const keepIndex = Math.min(
         muxedVideo.frameCount - 1,
@@ -818,6 +936,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       comparisonCanvas.hidden = false;
       videoPreview.hidden = true;
       showingComparison = true;
+      comparisonFrameIndex = keepIndex;
       compareButton.textContent = `Show raw PQ (frame ${keepIndex})`;
       logInfo('workbench', 'Rendered preview-matched comparison frame', {
         frameIndex: keepIndex,
@@ -828,6 +947,12 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     } catch (error) {
       logError('workbench', 'Comparison render failed', error);
       showWarning(`Comparison failed: ${describeError(error)}`);
+      // Return the stage to the player: a half-entered comparison state would
+      // leave a hidden canvas under a "Show raw PQ" label.
+      showingComparison = false;
+      comparisonFrameIndex = null;
+      comparisonCanvas.hidden = true;
+      videoPreview.hidden = false;
       compareButton.textContent = 'Compare like preview';
     } finally {
       compareButton.disabled = false;
@@ -1045,6 +1170,8 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
             if (videoObjectUrl) URL.revokeObjectURL(videoObjectUrl);
             muxedBlob = new Blob([produced.buffer], { type: produced.mimeType });
             videoObjectUrl = URL.createObjectURL(muxedBlob);
+            // A new file invalidates any comparison of the previous one.
+            resetComparisonView();
             videoPreview.src = videoObjectUrl;
             videoPreview.hidden = false;
             canvas.hidden = true;
@@ -1365,6 +1492,9 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     // A fresh render replaces any previously exported video in the stage.
     videoPreview.hidden = true;
     videoPreview.removeAttribute('src');
+    // If a comparison was showing, clear it: the stage is now the live canvas,
+    // and a stale comparison canvas would sit on top of it.
+    resetComparisonView();
     canvas.hidden = false;
     targetStat.value.textContent = selection.renderFormat;
     encoderStat.value.textContent = 'Not used (offline export only)';

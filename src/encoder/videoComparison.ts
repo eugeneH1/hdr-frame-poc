@@ -97,6 +97,35 @@ function previewMatchedPixel(encoded: number): number {
 }
 
 /**
+ * Presentation time to seek to for a given frame index.
+ *
+ * Seeking to the *midpoint* of a frame's display interval avoids landing on a
+ * boundary, where a decoder may return the previous or next frame. The result is
+ * clamped to the last frame's start time, because seeking beyond the final
+ * sample's start can yield no frame at all.
+ *
+ * Exported so the `<video>` player and the offscreen comparison decode seek to
+ * exactly the same instant; using two copies of this formula is how the two
+ * views end up showing different frames.
+ *
+ * @param frameIndex - Zero-based frame to seek to.
+ * @param frameCount - Total frames in the file.
+ * @param fps - Frame rate of the file.
+ * @returns Seek time in seconds.
+ */
+export function comparisonTimestampSeconds(
+  frameIndex: number,
+  frameCount: number,
+  fps: number,
+): number {
+  if (!(fps > 0) || !(frameCount > 0)) return 0;
+  const clampedIndex = Math.min(Math.max(Math.floor(frameIndex), 0), frameCount - 1);
+  const midpoint = (clampedIndex + 0.5) / fps;
+  const lastFrameStart = (frameCount - 1) / fps;
+  return Math.min(midpoint, Math.max(lastFrameStart, 0));
+}
+
+/**
  * Decodes one frame of an exported file and renders it with the preview's curve.
  *
  * Uses the browser's media stack (`<video>` + `drawImage`) rather than a
@@ -136,10 +165,7 @@ export async function renderComparisonFrame(
     });
 
     // Seek slightly inside the frame to avoid landing on a boundary.
-    const targetSeconds = Math.min(
-      (frameIndex + 0.5) / fps,
-      Math.max((frameCount - 1) / fps, 0),
-    );
+    const targetSeconds = comparisonTimestampSeconds(frameIndex, frameCount, fps);
     if (Math.abs(video.currentTime - targetSeconds) > 1e-3) {
       await new Promise<void>((resolve, reject) => {
         video.addEventListener('seeked', () => resolve(), { once: true });

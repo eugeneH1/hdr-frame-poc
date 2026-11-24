@@ -185,3 +185,10 @@ final write-up lives in `README.md`.
   both opt out; note that the peak frame has already been delivered by then, so
   the new selection applies to the *next* run (the current run keeps whatever
   frame was selected when it started).
+- "Compare like preview" and the raw player now share one seek target
+  (`comparisonTimestampSeconds`): toggling back pauses the player and seeks it to
+  the frame that was decoded, instead of revealing the element at its own
+  position (0 s on a fresh export). Toggling also pauses before hiding, so the
+  player cannot drift while the comparison is displayed. Starting a run or
+  producing a new export clears any comparison overlay; after a run, a later
+  compare reattaches the retained blob URL to the player.
