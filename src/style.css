@@ -511,6 +511,101 @@ code {
   margin: 0;
 }
 
+/* Diagnostics are visually subordinate to the HDR evidence above them. */
+.wb-stats--diag {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  opacity: 0.85;
+}
+
+/* --- Conformance badges -------------------------------------------------- */
+/*
+ * A single row directly under the title. Each badge leads with a coloured dot so
+ * pass/warn/fail is readable at a glance, and the value text stays monospace so
+ * numbers line up as they update during a run.
+ */
+.wb-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+}
+
+.wb-metric {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--code-bg);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.wb-metric::before {
+  content: '';
+  align-self: center;
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text);
+  opacity: 0.5;
+}
+
+.wb-metric-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.wb-metric-value {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text-h);
+  white-space: nowrap;
+}
+
+.wb-metric[data-state='pass'] {
+  border-color: rgba(21, 128, 61, 0.45);
+}
+
+.wb-metric[data-state='pass']::before {
+  background: #15803d;
+  opacity: 1;
+}
+
+.wb-metric[data-state='warn'] {
+  border-color: rgba(180, 83, 9, 0.45);
+}
+
+.wb-metric[data-state='warn']::before {
+  background: #b45309;
+  opacity: 1;
+}
+
+.wb-metric[data-state='fail'] {
+  border-color: rgba(185, 28, 28, 0.45);
+}
+
+.wb-metric[data-state='fail']::before {
+  background: #b91c1c;
+  opacity: 1;
+}
+
+/* The HDR tier carries the headline numbers, so it reads as primary data. */
+.wb-stat--hdr {
+  border-color: var(--accent-border);
+  background: var(--accent-bg);
+}
+
+.wb-stat--hdr .wb-stat-value {
+  font-size: 15px;
+}
+
 .wb-stat {
   margin: 0;
   padding: 10px 12px;

@@ -336,10 +336,48 @@ export interface FrameValueStats {
   readonly min: number;
   /** Largest sampled linear RGB channel value (peaks above 1.0 indicate HDR). */
   readonly max: number;
+  /**
+   * Linear RGB of the pixel carrying `max`. On a composited frame this is the
+   * most extreme channel, so `max !== Math.max(...peak.rgb)` is not an error.
+   */
+  readonly peak: readonly [r: number, g: number, b: number];
   /** Center pixel RGBA in linear working-space units. */
   readonly sample: readonly [r: number, g: number, b: number, a: number];
   /** Number of pixels actually inspected to produce `min`/`max`. */
   readonly sampledPixels: number;
+  /** Total pixels in the frame; `sampledPixels / pixelCount` is the coverage. */
+  readonly pixelCount: number;
+}
+
+/**
+ * Brightest sample seen across every delivered frame of a run.
+ *
+ * Unlike `lastFrameValues`, this is not overwritten per frame: it answers
+ * "did anything in this sequence exceed diffuse white?", which is the property
+ * that makes the output HDR rather than merely float.
+ */
+export interface SequencePeak {
+  /** Largest sampled linear channel value across the run. */
+  readonly value: number;
+  /** Frame index that produced `value`. */
+  readonly frameIndex: number;
+  /**
+   * `value` expressed in absolute nits using the renderer's scene-linear
+   * convention (1.0 = `whiteNits`), so the UI can report a display unit.
+   */
+  readonly nits: number;
+  /** Scene-linear value that represents 100%-reference white. */
+  readonly whiteNits: number;
+  /**
+   * Fraction of pixels inspected on the peak frame (`sampledPixels / pixelCount`).
+   * Stored with the peak because the UI's "sampled N%" tooltip must describe the
+   * frame that set it, not whichever frame is currently being displayed.
+   */
+  readonly coverage: number;
+  /** Linear RGB of the pixel that carried `value`. */
+  readonly rgb: readonly [number, number, number];
+  /** True when the most recently delivered frame is the one that set the peak. */
+  readonly lastFrameValuesIsPeak: boolean;
 }
 
 /** Counters and timing values sampled while a render run is in progress. */
@@ -354,10 +392,22 @@ export interface TelemetrySnapshot {
   readonly lastFrameMs: number;
   /** Rolling average frame production time in milliseconds. */
   readonly averageFrameMs: number;
-  /** Bytes transferred from GPU to CPU since the run started. */
+  /**
+   * GPU staging bytes copied for readback since the run started. This is the
+   * source-precision transfer size (`rgba16float` = 8 B/px), not the size of
+   * the expanded CPU `Float32Array` payload consumers receive.
+   */
   readonly readbackBytes: number;
-  /** Estimated bytes currently retained in memory for buffered frames. */
+  /** Bytes per GPU readback, i.e. one staging buffer's padded size. */
+  readonly readbackPerFrameBytes: number;
+  /**
+   * Bytes the pipeline itself still holds after releasing delivered frames.
+   * Non-zero only when `reuseOutputBuffer` keeps a shared CPU payload; it does
+   * not include staging buffers, in-flight frames, or consumer copies.
+   */
   readonly retainedBytes: number;
+  /** GPU staging memory allocated for the readback ring (constant per run). */
+  readonly stagingBytes: number;
   /** Non-fatal problems encountered (e.g. dropped preview frame). */
   readonly warnings: readonly string[];
   /** Zero-based index of the most recently completed frame, or -1 before any. */
@@ -368,6 +418,8 @@ export interface TelemetrySnapshot {
   readonly renderFormat?: GPUTextureFormat;
   /** Sampled value statistics for the most recently completed frame. */
   readonly lastFrameValues?: FrameValueStats;
+  /** Brightest sample seen across the run so far; absent before the first frame. */
+  readonly sequencePeak?: SequencePeak;
   /** Stage timing breakdown for the most recently completed frame. */
   readonly lastFrameTimings?: FrameTimingBreakdown;
   /** Rolling per-stage averages across all completed frames. */

@@ -160,3 +160,25 @@ section will be expanded into the final README.
 - [ ] Render text (Canvas 2D/SDF source, linearized and scaled into HDR range).
 - [ ] Investigate/present HDR output accurately where the browser supports it.
 - [ ] Write the final README (this draft is the source material).
+
+### Telemetry sampling and verification
+
+- Per-frame min/max/peak telemetry samples pixels on a stride of **1031**, not a
+  power of two. A stride of 16 against a 1280 px row probes only 80 fixed
+  columns, so a 3 px highlight between them is invisible (measured: such a frame
+  read 0.02 instead of 9.0). The coprime stride drifts one column per row.
+- The run peak is tracked across all frames, separately from the last frame's
+  values, because shape opacity animates: for the shipped scene the run peak is
+  ~5.32 (532 nits) around frame 120 while the final frame only reaches ~3.35.
+- "Verify peak (exact)" re-scans the retained frame over every pixel
+  (~3 ms for 720p) and reconciles it with the sampled run peak, warning when
+  they disagree by more than 0.5%. This turns the soft sampled metric into a
+  checkable one without paying a full scan per frame.
+- A GPU reduction pass (compute shader -> small readback) is the planned way to
+  get an exact per-frame peak at near-zero CPU cost.
+- The "Frame to keep" field follows the run peak after a completed run, so
+  "Download frame" and "Verify peak (exact)" act on the most interesting frame
+  without the user retyping the peak's index. Cancelled runs and manual edits
+  both opt out; note that the peak frame has already been delivered by then, so
+  the new selection applies to the *next* run (the current run keeps whatever
+  frame was selected when it started).

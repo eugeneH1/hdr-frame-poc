@@ -25,10 +25,12 @@ import type {
   FloatFrame,
   FrameMeta,
   RenderConfig,
+  SequencePeak,
   TelemetrySnapshot,
 } from '../types/frame.ts';
 import { getWorkingColorSpace } from '../timeline/sceneAnimator.ts';
-import { runFramePipeline } from '../pipeline/framePipeline.ts';
+import { runFramePipeline, scanFrameExact } from '../pipeline/framePipeline.ts';
+import type { ExactFrameScan } from '../pipeline/framePipeline.ts';
 import { createVideoEncoderTap, flushAndClose } from '../encoder/webCodecsTap.ts';
 import type { VideoEncoderTap } from '../encoder/webCodecsTap.ts';
 import { canMuxVideo, muxVideo } from '../encoder/videoContainer.ts';
@@ -41,6 +43,12 @@ const DEFAULT_WIDTH = 1280;
 const DEFAULT_HEIGHT = 720;
 const DEFAULT_FPS = 30;
 const DEFAULT_FRAME_COUNT = 300;
+
+/**
+ * Scene-linear luminance of reference white, matching `REFERENCE_WHITE_NITS` in
+ * the pipeline and encoder. Used only to annotate linear values with nits.
+ */
+const SCENE_WHITE_NITS = 100;
 
 /**
  * Codecs the export pass is allowed to select, in preference order.
@@ -95,9 +103,18 @@ export interface Workbench {
 
 type WorkbenchState = 'idle' | 'running' | 'cancelling' | 'cancelled' | 'done' | 'error';
 
+/** Which stat group a cell belongs to; drives emphasis and ordering. */
+type StatTier = 'hdr' | 'diag';
+
 interface StatCell {
   readonly cell: HTMLDivElement;
   readonly value: HTMLElement;
+}
+
+/** A conformance badge in the header strip (role="status" so it is announced). */
+interface MetricBadge {
+  readonly element: HTMLSpanElement;
+  state: 'unknown' | 'pass' | 'warn' | 'fail';
 }
 
 /** One encoded chunk plus the metadata WebCodecs emitted alongside it. */
@@ -110,6 +127,8 @@ interface RetainedFrame {
   readonly height: number;
   /** Copied out of the streaming pipeline, so this owns a regular ArrayBuffer. */
   readonly pixels: Float32Array<ArrayBuffer>;
+  /** Exact rescan of `pixels`, computed lazily and cached per retained frame. */
+  exactScan?: ExactFrameScan;
 }
 
 function createElement<K extends keyof HTMLElementTagNameMap>(
@@ -131,32 +150,64 @@ function createOption(value: string, label: string, disabled = false): HTMLOptio
   return option;
 }
 
-function createStat(label: string): StatCell {
-  const cell = createElement('div', 'wb-stat');
+function createStat(label: string, tier: StatTier = 'diag', title?: string): StatCell {
+  const cell = createElement('div', `wb-stat wb-stat--${tier}`);
   const term = createElement('dt', 'wb-stat-label', label);
   const value = createElement('dd', 'wb-stat-value', '—');
+  if (title) term.title = title;
   cell.append(term, value);
   return { cell, value };
+}
+
+/** Creates a header badge whose dot colour encodes pass/warn/fail/unknown. */
+function createBadge(label: string, title: string): MetricBadge {
+  const element = createElement('span', 'wb-metric');
+  element.dataset.state = 'unknown';
+  element.title = title;
+  element.append(
+    createElement('span', 'wb-metric-label', label),
+    createElement('span', 'wb-metric-value', '—'),
+  );
+  return { element, state: 'unknown' };
+}
+
+function setBadge(badge: MetricBadge, state: MetricBadge['state'], text: string): void {
+  badge.state = state;
+  badge.element.dataset.state = state;
+  const value = badge.element.lastElementChild;
+  if (value) value.textContent = text;
 }
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** Formats a sampled value as linear-light plus the display nits it decodes to. */
+function formatValueWithNits(value: number): string {
+  return `${formatFixed(value, 2)} (${formatNits(value * SCENE_WHITE_NITS)})`;
+}
+
 function formatFixed(value: number, digits = 3): string {
   return Number.isFinite(value) ? value.toFixed(digits) : '—';
 }
 
-function formatMegabytes(bytes: number): string {
-  return (bytes / (1024 * 1024)).toFixed(1);
+/** Binary megabytes, labelled MiB so it cannot be confused with the decimal MB used for video files. */
+function formatMiB(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
-/** Formats cumulative streamed frame bytes using GB once past 1 GiB. */
+/** `748` -> `748 nits`, `12000` -> `12.0k nits`. */
+function formatNits(nits: number): string {
+  if (!Number.isFinite(nits)) return '—';
+  return nits >= 10_000 ? `${(nits / 1000).toFixed(1)}k nits` : `${Math.round(nits)} nits`;
+}
+
+/** Formats cumulative streamed frame bytes using GiB once past 1 GiB. */
 function formatStreamedBytes(bytes: number): string {
-  const megabytes = bytes / (1024 * 1024);
-  return megabytes >= 1024
-    ? `${(megabytes / 1024).toFixed(2)} GB`
-    : `${megabytes.toFixed(1)} MB`;
+  const mebibytes = bytes / (1024 * 1024);
+  return mebibytes >= 1024
+    ? `${(mebibytes / 1024).toFixed(2)} GiB`
+    : `${mebibytes.toFixed(1)} MiB`;
 }
 
 /**
@@ -319,6 +370,10 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   let unmounted = false;
   let activeController: AbortController | null = null;
   let retainedFrame: RetainedFrame | null = null;
+  /** Sampled run peak, kept so an exact scan can be compared against it. */
+  let sampledRunPeak: SequencePeak | null = null;
+  /** True once the user edits the keep-frame field, disabling auto-follow. */
+  let userChoseKeepFrame = false;
   let muxedVideo: MuxedVideoFile | null = null;
   let muxedTransfer: 'pq' | 'hlg' = 'pq';
   let videoObjectUrl: string | null = null;
@@ -341,6 +396,25 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
 
   const stateBadge = createElement('span', 'wb-state', 'Idle');
   stateBadge.dataset.state = 'idle';
+
+  // Conformance strip: the three facts that make the output HDR — the values
+  // actually left the GPU above 1.0, the target stayed float, and the frame
+  // contract (resolution / rate / duration) held. Placed above the fold because
+  // these are the properties being demonstrated, not diagnostics.
+  const badges = createElement('div', 'wb-badges');
+  const hdrRangeBadge = createBadge(
+    'HDR range',
+    'Brightest linear sample across the whole run. A value above 1.0 is what makes the frame HDR rather than merely float.',
+  );
+  const targetBadge = createBadge(
+    'HDR target',
+    'Float render target actually negotiated, plus the linear working space and the delivery transfer function.',
+  );
+  const formatBadge = createBadge(
+    'Frame contract',
+    'Requested resolution, frame rate and total duration, and whether every frame was returned as Float32.',
+  );
+  badges.append(hdrRangeBadge.element, targetBadge.element, formatBadge.element);
 
   const controls = createElement('div', 'wb-controls');
   const formatField = createElement('label', 'wb-field');
@@ -374,7 +448,9 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   frameIndexInput.max = String(DEFAULT_FRAME_COUNT - 1);
   frameIndexInput.step = '1';
   frameIndexInput.value = '0';
-  frameIndexInput.title = 'Frame copied out through onFrame for the .npy download';
+  frameIndexInput.title =
+    'Frame copied out through onFrame for the .npy download. Follows the run ' +
+    'peak after the first run unless you edit it.';
   frameField.append(
     createElement('span', 'wb-field-label', 'Frame to keep'),
     frameIndexInput,
@@ -385,6 +461,15 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   downloadButton.disabled = true;
   downloadButton.title =
     'Download the kept frame as .npy (H×W×4 float32, linear Rec.2020)';
+
+  // One-off exact check of the retained frame. The per-frame telemetry samples
+  // pixels to stay cheap, so this button answers "is the sampled peak the real
+  // peak?" without paying for a full scan on every frame.
+  const verifyButton = createElement('button', 'wb-button', 'Verify peak (exact)');
+  verifyButton.type = 'button';
+  verifyButton.disabled = true;
+  verifyButton.title =
+    'Scan every pixel of the kept frame and compare the result with the sampled run peak. ';
 
   const downloadVideoButton = createElement('button', 'wb-button', 'Download video');
   downloadVideoButton.type = 'button';
@@ -404,6 +489,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     startButton,
     cancelButton,
     downloadButton,
+    verifyButton,
     exportButton,
     downloadVideoButton,
     compareButton,
@@ -435,38 +521,87 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   stage.append(canvas, videoPreview, comparisonCanvas);
 
   // --- Telemetry -------------------------------------------------------------
-  const stats = createElement('dl', 'wb-stats');
-  const frameStat = createStat('Frames rendered');
-  const returnedStat = createStat('Frames returned');
-  const elapsedStat = createStat('Elapsed');
-  const timingStat = createStat('Frame time');
-  const renderTimingStat = createStat('Render / preview');
-  const readbackTimingStat = createStat('Readback / unpack');
-  const encodeTimingStat = createStat('Encode (tap)');
-  const peakStat = createStat('Peak (sampled)');
-  const sampleStat = createStat('Center pixel RGBA');
-  const readbackStat = createStat('Readback');
-  const targetStat = createStat('Active HDR target');
-  const retainedStat = createStat('Pipeline retained');
-  const keptFrameStat = createStat('Kept frame');
-  const fpsStat = createStat('FPS');
-  const encoderStat = createStat('VideoEncoder');
-  const chunksStat = createStat('Encoded chunks');
-  stats.append(
+  // Two tiers. `hdr` answers "is this a working HDR pipeline and can it sustain
+  // the brief?"; `diag` is per-stage detail that explains a slow or odd run.
+  const hdrStats = createElement('dl', 'wb-stats wb-stats--hdr');
+  const diagStats = createElement('dl', 'wb-stats wb-stats--diag');
+
+  const peakStat = createStat(
+    'HDR peak (run)',
+    'hdr',
+    'Brightest sampled channel over every delivered frame, with the frame that hit it, in nits (1.0 = 100 nits).',
+  );
+  const sampleStat = createStat(
+    'Center pixel',
+    'hdr',
+    'Linear Rec.2020 RGBA at pixel (width/2, height/2) of the latest frame.',
+  );
+  const frameStat = createStat('Frames rendered', 'hdr');
+  const returnedStat = createStat(
+    'Frames returned',
+    'hdr',
+    'Float32 frames delivered through onFrame, with the cumulative CPU payload size.',
+  );
+  const fpsStat = createStat(
+    'Measured FPS',
+    'hdr',
+    'Frames completed per second over the last 30 deliveries. The timeline is a fixed 30 fps; this is throughput, not the output rate.',
+  );
+  const elapsedStat = createStat('Elapsed', 'hdr');
+
+  const targetStat = createStat('Active HDR target', 'diag');
+  const timingStat = createStat('Frame time', 'diag');
+  const renderTimingStat = createStat(
+    'Render / preview',
+    'diag',
+    'CPU time to evaluate the scene, record commands and submit. Not GPU execution time; GPU time appears in the readback wait.',
+  );
+  const readbackTimingStat = createStat(
+    'Readback / unpack',
+    'diag',
+    'mapAsync wait (includes GPU copy time) and CPU half-float decode.',
+  );
+  const encodeTimingStat = createStat(
+    'Encode (tap)',
+    'diag',
+    'Time spent submitting a frame to the encoder plus any back-pressure drain. Does not measure asynchronous encode completion.',
+  );
+  const readbackStat = createStat(
+    'GPU staging readback',
+    'diag',
+    'Bytes copied GPU->CPU at source precision. rgba16float is 8 B/px, so half of the Float32 payload consumers receive.',
+  );
+  const retainedStat = createStat(
+    'Staging memory',
+    'diag',
+    'MAP_READ staging ring allocated for the run, plus any shared reuse buffer the pipeline holds.',
+  );
+  const keptFrameStat = createStat(
+    'Exact scan',
+    'diag',
+    'Full every-pixel scan of the kept frame, used to verify the sampled run peak instead of trusting it.',
+  );
+  const encoderStat = createStat('VideoEncoder', 'diag');
+  const chunksStat = createStat('Encoded chunks', 'diag');
+
+  // HDR tier first so the evidence sits next to the preview, not below the fold.
+  hdrStats.append(
+    peakStat.cell,
+    sampleStat.cell,
     frameStat.cell,
     returnedStat.cell,
+    fpsStat.cell,
     elapsedStat.cell,
+  );
+  diagStats.append(
+    targetStat.cell,
     timingStat.cell,
     renderTimingStat.cell,
     readbackTimingStat.cell,
     encodeTimingStat.cell,
-    peakStat.cell,
-    sampleStat.cell,
     readbackStat.cell,
-    targetStat.cell,
     retainedStat.cell,
     keptFrameStat.cell,
-    fpsStat.cell,
     encoderStat.cell,
     chunksStat.cell,
   );
@@ -474,9 +609,9 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   const note = createElement(
     'p',
     'wb-note',
-    'Frames are streamed: each Float32 frame (~14.75 MB at 1280×720) is delivered through ' +
+    'Frames are streamed: each Float32 frame (14.06 MiB at 1280×720) is delivered through ' +
       'onFrame and released afterwards; only the selected frame is copied for download, so a ' +
-      '300-frame run never retains all frames (~4.4 GB if it did). “Download frame” saves the ' +
+      '300-frame run never retains all frames (~4.12 GiB if it did). “Download frame” saves the ' +
       'kept frame as .npy (H×W×4 float32, linear Rec.2020). Rendering is render-only: ' +
       '“Export HDR video” re-renders the same deterministic timeline headlessly and encodes it ' +
       'offline as I420P10 (I420/RGBA fallback), so encoding never slows the live preview.',
@@ -491,7 +626,17 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   const warningEl = createElement('p', 'wb-warning');
   warningEl.hidden = true;
 
-  container.append(header, stage, controls, stats, note, encoderNote, warningEl);
+  container.append(
+    header,
+    badges,
+    stage,
+    controls,
+    hdrStats,
+    diagStats,
+    note,
+    encoderNote,
+    warningEl,
+  );
   root.replaceChildren(container);
 
   function setState(state: WorkbenchState, label: string): void {
@@ -506,8 +651,122 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
 
   function clearRetainedFrame(): void {
     retainedFrame = null;
+    // `sampledRunPeak` deliberately survives: the exact scan is compared against
+    // the peak of the run that produced the frame, not the peak of the pass that
+    // happens to be starting.
     keptFrameStat.value.textContent = '—';
     downloadButton.disabled = true;
+    verifyButton.disabled = true;
+    verifyButton.textContent = 'Verify peak (exact)';
+    // The peak stat's tooltip describes the previous run's coverage; leaving it
+    // alongside a cleared value would pair stale prose with an em dash.
+    peakStat.value.title = '';
+  }
+
+  /**
+   * Runs the every-pixel scan on the retained frame and reconciles it with the
+   * sampled run peak.
+   *
+   * The scan is cached on the retained frame, so pressing twice is free. When the
+   * kept frame is the one that set the sampled peak, the two numbers must agree
+   * to within float noise; a disagreement means the sampler missed a highlight,
+   * which is exactly the failure mode this check exists to catch.
+   */
+  function onVerifyClick(): void {
+    if (!retainedFrame) return;
+
+    verifyButton.disabled = true;
+    verifyButton.textContent = 'Scanning…';
+    // Yield once so the button's busy state paints before the synchronous scan.
+    setTimeout(() => {
+      if (!retainedFrame) {
+        verifyButton.textContent = 'Verify peak (exact)';
+        return;
+      }
+      try {
+        const scan =
+          retainedFrame.exactScan ??
+          (retainedFrame.exactScan = scanFrameExact(retainedFrame.pixels, retainedFrame.width));
+        const keptIndex = retainedFrame.frameIndex;
+        const peakAtSameFrame =
+          sampledRunPeak !== null && sampledRunPeak.frameIndex === keptIndex;
+
+        keptFrameStat.value.textContent =
+          `${formatValueWithNits(scan.max)} @ (${scan.peakX}, ${scan.peakY}) · ` +
+          `${scan.elapsedMs.toFixed(0)} ms`;
+
+        if (peakAtSameFrame && sampledRunPeak) {
+          const delta = scan.max - sampledRunPeak.value;
+          const relative = sampledRunPeak.value > 0 ? Math.abs(delta) / sampledRunPeak.value : 0;
+          // Float32 compositing makes exact equality unrealistic; 0.5% is well
+          // inside one sampling-lattice miss and far below a real discrepancy.
+          const agrees = relative <= 0.005;
+          setBadge(
+            hdrRangeBadge,
+            agrees ? 'pass' : 'warn',
+            `${scan.max.toFixed(2)} exact · ${formatNits(scan.max * SCENE_WHITE_NITS)}` +
+              (agrees ? '' : ` (sampled ${sampledRunPeak.value.toFixed(2)})`),
+          );
+          logInfo('workbench', 'Exact scan of kept frame', {
+            frameIndex: keptIndex,
+            exactMax: scan.max,
+            sampledMaxAtSameFrame: sampledRunPeak.value,
+            delta,
+            agrees,
+            peak: { x: scan.peakX, y: scan.peakY },
+            scanMs: Math.round(scan.elapsedMs),
+          });
+        } else {
+          // The kept frame is not the run's peak frame, so the scan verifies the
+          // scan itself (value and location), not the run peak.
+          verifyButton.title =
+            `Kept frame #${keptIndex} is not the run-peak frame ` +
+            `(#${sampledRunPeak?.frameIndex ?? '?'}), so this checks frame ` +
+            `#${keptIndex} only.`;
+          logInfo('workbench', 'Exact scan of kept frame (not the peak frame)', {
+            frameIndex: keptIndex,
+            exactMax: scan.max,
+            runPeakFrame: sampledRunPeak?.frameIndex ?? null,
+            peak: { x: scan.peakX, y: scan.peakY },
+            scanMs: Math.round(scan.elapsedMs),
+          });
+        }
+      } finally {
+        verifyButton.textContent = 'Verify peak (exact)';
+        verifyButton.disabled = retainedFrame === null;
+      }
+    }, 0);
+  }
+
+  /**
+   * Clears every run-scoped readout before a new pass starts. Without this a
+   * new run or export displays the previous run's peak, timings and frame
+   * counts until telemetry arrives, which reads as if the new run inherited
+   * them.
+   */
+  function resetRunReadouts(): void {
+    for (const stat of [
+      frameStat,
+      returnedStat,
+      elapsedStat,
+      timingStat,
+      renderTimingStat,
+      readbackTimingStat,
+      readbackStat,
+      retainedStat,
+      fpsStat,
+    ]) {
+      stat.value.textContent = '—';
+    }
+    peakStat.value.textContent = '—';
+    sampleStat.value.textContent = '—';
+    encodeTimingStat.value.textContent = '—';
+    sampledRunPeak = null;
+
+    // Badges describe the data, not the request, so they reset to unknown and
+    // only turn green once a frame has actually proved the property.
+    setBadge(hdrRangeBadge, 'unknown', 'awaiting first frame');
+    setBadge(targetBadge, 'unknown', 'not negotiated yet');
   }
 
   function onDownloadClick(): void {
@@ -589,7 +848,14 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   }
 
   function onFrameIndexChange(): void {
-    if (!running) clearRetainedFrame();
+    if (running) return;
+    // Once the user picks a frame by hand, a later run must not silently move
+    // their selection out from under them.
+    userChoseKeepFrame = true;
+    // Drop any "auto-set to the run peak" wording left by a previous run.
+    frameIndexInput.title =
+      'Frame copied out through onFrame for the .npy download (chosen manually).';
+    clearRetainedFrame();
   }
 
   /**
@@ -614,6 +880,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     frameIndexInput.disabled = true;
     showWarning('');
     setState('running', 'Exporting');
+    resetRunReadouts();
 
     const controller = new AbortController();
     activeController = controller;
@@ -635,6 +902,12 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     chunksStat.value.textContent = '—';
     encoderNote.hidden = true;
     encoderNote.textContent = '';
+
+    // Export returns frames to the encoder, not to `onFrame`, so the returned
+    // tile must describe this pass rather than keep the preview run's numbers.
+    returnedStat.value.textContent = `none (frames go to encoder)`;
+    clearRetainedFrame();
+    setContractBadge(config, 'fail', 0);
 
     try {
       logInfo('workbench', 'Creating VideoEncoder tap for offline export', {
@@ -713,7 +986,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
           onTelemetry: (snapshot) => {
             updateTelemetry(snapshot);
             chunksStat.value.textContent =
-              `${videoChunks.length} chunks · ${formatMegabytes(tap.status().chunkBytes)} MB`;
+              `${videoChunks.length} chunks · ${formatMiB(tap.status().chunkBytes)} encoded`;
           },
           onWarning: showWarning,
         },
@@ -721,6 +994,15 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
 
       updateEncoderReadout(tap.status(), true);
       setState(summary.cancelled ? 'cancelled' : 'done', summary.cancelled ? 'Cancelled' : 'Complete');
+      // The export contract is "every frame reached the encoder"; `onFrame` is
+      // not used on this path, so the encoder's own submission count is the
+      // evidence that no frame was dropped under back-pressure.
+      const submitted = tap.status().framesSubmitted;
+      setContractBadge(
+        config,
+        !summary.cancelled && submitted === config.frameCount ? 'pass' : 'fail',
+        submitted,
+      );
 
       // Timing is derived from chunk timestamps, not summed durations; logging
       // it makes an off-by-one-frame shortfall immediately visible.
@@ -767,18 +1049,17 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
             videoPreview.hidden = false;
             canvas.hidden = true;
 
-            const megabytes = (produced.buffer.byteLength / (1024 * 1024)).toFixed(2);
-            chunksStat.value.textContent =
-              `${produced.frameCount} frames · ${megabytes} MB ${produced.extension.toUpperCase()} · ` +
-              `${produced.codecFamily}/${muxedTransfer}`;
+            const megabytes = (produced.buffer.byteLength / 1_000_000).toFixed(2);
             logInfo('workbench', 'Muxed HDR video', {
               container: produced.extension,
               codecFamily: produced.codecFamily,
               transfer: muxedTransfer,
               frames: produced.frameCount,
               bytes: produced.buffer.byteLength,
+              megabytes: Number(megabytes),
               durationSeconds: Number(produced.durationSeconds.toFixed(3)),
             });
+            showMuxedVideoSummary(produced, muxedTransfer);
             showWarning('');
           } else {
             showWarning('Export finished but produced no muxable chunks.');
@@ -802,7 +1083,10 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       showWarning(`Export failed: ${describeError(error)}`);
     } finally {
       await flushAndClose(encoderTap);
-      if (encoderTap) updateEncoderReadout(encoderTap.status(), true);
+      // Only refresh the tile from the tap when no file summary was written:
+      // `showMuxedVideoSummary` is the more useful final state and the live
+      // counters are preserved in its tooltip.
+      if (encoderTap && !muxedVideo) updateEncoderReadout(encoderTap.status(), true);
 
       if (activeController === controller) activeController = null;
       running = false;
@@ -834,12 +1118,48 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
         : `${status.frameFormat} (8-bit fallback)`;
     encoderStat.value.textContent =
       `${status.state} · ${status.codec} · ${formatLabel} · ${status.colorSpace}`;
-    chunksStat.value.textContent =
+    encoderStat.value.title =
       `${status.framesSubmitted} sent · ${status.chunksEmitted} chunks · ` +
-      `${formatMegabytes(status.chunkBytes)} MB · ${status.keyFrames} key · q${status.encodeQueueSize}`;
+      `${formatMiB(status.chunkBytes)} · ${status.keyFrames} key · q${status.encodeQueueSize}`;
     if (status.lastError) {
       showWarning(`VideoEncoder: ${status.lastError}`);
     }
+  }
+
+  /**
+   * Reports the finalized container instead of live encoder counters.
+   *
+   * The live counters only describe the encode pass; once the file exists, the
+   * facts that matter are its format, size, and duration — in particular that
+   * the duration really is the 10 s the brief asks for.
+   */
+  function showMuxedVideoSummary(video: MuxedVideoFile, transfer: 'pq' | 'hlg'): void {
+    const sizeMb = video.buffer.byteLength / 1_000_000;
+    // Video file sizes are decimal (MB), unlike the binary MiB used for memory.
+    encoderStat.value.textContent =
+      `${video.codecFamily} · ${video.extension.toUpperCase()} · Rec.2020/${transfer}`;
+    chunksStat.value.textContent =
+      `${video.frameCount} frames · ${video.durationSeconds.toFixed(2)} s · ${sizeMb.toFixed(2)} MB`;
+    chunksStat.value.title =
+      `Muxed file: ${video.frameCount} frames, ${video.durationSeconds.toFixed(3)} s, ` +
+      `${video.buffer.byteLength} bytes, ${video.mimeType}`;
+  }
+
+  /**
+   * States the brief's own numbers up front so a run can be checked against the
+   * requirements without counting tiles: resolution, rate, duration, and how many
+   * frames must come back through `onFrame`. Outcome (`n / total`) is supplied by
+   * the caller: the preview path counts `onFrame` deliveries, the export path
+   * counts frames handed to the encoder.
+   */
+  function setContractBadge(config: RenderConfig, outcome: 'pass' | 'fail', delivered: number): void {
+    const seconds = config.frameCount / config.fps;
+    setBadge(
+      formatBadge,
+      outcome,
+      `${config.width}×${config.height} · ${config.fps} fps · ${seconds.toFixed(2)} s · ` +
+        `${delivered}/${config.frameCount} frames`,
+    );
   }
 
   function updateTelemetry(snapshot: TelemetrySnapshot): void {
@@ -848,15 +1168,22 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     frameStat.value.textContent = `${snapshot.framesCompleted} / ${snapshot.framesTotal}`;
     elapsedStat.value.textContent = `${Math.round(snapshot.elapsedMs ?? 0)} ms`;
 
+    // `average` here is cumulative (elapsed / frames), so the label says so
+    // rather than implying a moving window.
     timingStat.value.textContent =
       snapshot.framesCompleted > 0
-        ? `${snapshot.lastFrameMs.toFixed(1)} ms · avg ${snapshot.averageFrameMs.toFixed(1)} ms`
+        ? `${snapshot.lastFrameMs.toFixed(1)} ms · cum avg ${snapshot.averageFrameMs.toFixed(1)} ms`
         : '—';
 
-    // Frames completed per second over the pipeline's sliding timing window.
-    // Two decimals so small frame-to-frame jitter stays visible.
+    // Frames completed per second over the last 30 deliveries. Labelled `fps`
+    // and annotated with the fixed timeline rate so render throughput is never
+    // mistaken for the output frame rate. Two decimals keep jitter visible.
+    const budgetMs = 1000 / DEFAULT_FPS;
     fpsStat.value.textContent =
-      snapshot.measuredFps > 0 ? snapshot.measuredFps.toFixed(2) : '—';
+      snapshot.measuredFps > 0 ? `${snapshot.measuredFps.toFixed(2)} fps` : '—';
+    fpsStat.value.title =
+      `Render throughput (last 30 frames) vs the fixed ${DEFAULT_FPS} fps timeline ` +
+      `(${budgetMs.toFixed(1)} ms/frame budget).`;
 
     const timing = snapshot.lastFrameTimings;
     const average = snapshot.averageFrameTimings;
@@ -878,17 +1205,57 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
           (average ? ` · avg ${average.encodeMs.toFixed(1)} ms` : '')
         : '—';
 
+    // Run-wide peak: the single most useful HDR signal, so it leads with nits
+    // and notes the frame that produced it. `min–max` of the last frame is a
+    // tooltip detail, not the headline.
+    const peak = snapshot.sequencePeak;
     const values = snapshot.lastFrameValues;
-    peakStat.value.textContent = values
-      ? `${formatFixed(values.min)} – ${formatFixed(values.max)}`
-      : '—';
+    if (peak) {
+      // Remembered so `onVerifyClick` can reconcile an exact scan against it.
+      sampledRunPeak = peak;
+      peakStat.value.textContent =
+        `${peak.value.toFixed(2)} (${formatNits(peak.nits)}) @ #${peak.frameIndex}`;
+      // Coverage comes from the peak frame, not the current one, so the two
+      // numbers in this tooltip always describe the same frame.
+      const coveragePct = (peak.coverage * 100).toFixed(2);
+      peakStat.value.title =
+        peak.value > 1
+          ? `Pixel R ${formatValueWithNits(peak.rgb[0])} · G ${formatValueWithNits(peak.rgb[1])} · ` +
+            `B ${formatValueWithNits(peak.rgb[2])}. Sampled ${coveragePct}% of the peak ` +
+            `frame's pixels (frame #${peak.frameIndex}); use “Verify peak (exact)” for a ` +
+            `full scan.`
+          : `No sample exceeded reference white (1.0); sampled ${coveragePct}% of pixels.`;
+      setBadge(
+        hdrRangeBadge,
+        peak.value > 1 ? 'pass' : 'warn',
+        peak.value > 1
+          ? `${peak.value.toFixed(2)} peak · ${formatNits(peak.nits)}`
+          : `<= 1.0 (${formatNits(peak.nits)})`,
+      );
+    } else if (values) {
+      // First frame, before the sequence peak exists.
+      peakStat.value.textContent = `${formatFixed(values.min)} – ${formatFixed(values.max)}`;
+    }
+
     sampleStat.value.textContent = values
-      ? values.sample.map((channel) => formatFixed(channel, 2)).join(', ')
+      ? `R ${formatValueWithNits(values.sample[0])} · G ${formatValueWithNits(values.sample[1])} · ` +
+        `B ${formatValueWithNits(values.sample[2])} · A ${formatFixed(values.sample[3], 2)}`
       : '—';
 
-    readbackStat.value.textContent = `${formatMegabytes(snapshot.readbackBytes)} MB`;
-    retainedStat.value.textContent = `${formatMegabytes(snapshot.retainedBytes)} MB`;
-    if (snapshot.renderFormat) targetStat.value.textContent = snapshot.renderFormat;
+    readbackStat.value.textContent =
+      `${formatMiB(snapshot.readbackBytes)} total · ${formatMiB(snapshot.readbackPerFrameBytes)}/frame`;
+    retainedStat.value.textContent =
+      `${formatMiB(snapshot.stagingBytes)} staging` +
+      (snapshot.retainedBytes > 0 ? ` · ${formatMiB(snapshot.retainedBytes)} reuse` : '');
+
+    if (snapshot.renderFormat) {
+      targetStat.value.textContent = snapshot.renderFormat;
+      setBadge(
+        targetBadge,
+        snapshot.renderFormat.endsWith('float') ? 'pass' : 'fail',
+        `${snapshot.renderFormat} · Rec.2020-linear`,
+      );
+    }
 
     if (snapshot.encoder) {
       updateEncoderReadout(snapshot.encoder, true);
@@ -897,6 +1264,36 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     if (snapshot.warnings.length > 0) {
       showWarning(snapshot.warnings.join('\n'));
     }
+  }
+
+  /**
+   * Moves the keep-frame selection onto the frame that set the run peak.
+   *
+   * Skipped when the run was cancelled (the peak may be partial), when no peak
+   * was recorded, or once the user has typed a frame index themselves. The peak
+   * frame has already been delivered by this point, so the updated selection
+   * means "keep this frame next time" — it never re-delivers the current run.
+   */
+  function followRunPeak(config: RenderConfig, cancelled: boolean): void {
+    if (cancelled || userChoseKeepFrame || sampledRunPeak === null) return;
+
+    const peakIndex = Math.min(
+      config.frameCount - 1,
+      Math.max(0, sampledRunPeak.frameIndex),
+    );
+    const previous = Number.parseInt(frameIndexInput.value, 10);
+    if (previous === peakIndex) return;
+
+    frameIndexInput.value = String(peakIndex);
+    frameIndexInput.title =
+      `Frame copied out through onFrame for the .npy download (auto-set to the run peak, ` +
+      `frame #${peakIndex})`;
+    logInfo('workbench', 'Keep-frame selection followed the run peak', {
+      previousKeepIndex: Number.isFinite(previous) ? previous : null,
+      keepIndex: peakIndex,
+      peakFrameIndex: sampledRunPeak.frameIndex,
+      peakValue: Number(sampledRunPeak.value.toFixed(4)),
+    });
   }
 
   async function run(): Promise<void> {
@@ -936,12 +1333,20 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       ? Math.min(config.frameCount - 1, Math.max(0, Math.floor(requestedKeepIndex)))
       : 0;
     frameIndexInput.max = String(config.frameCount - 1);
+    // Keep the input in sync with the clamped value actually used.
     frameIndexInput.value = String(keepFrameIndex);
+    if (!userChoseKeepFrame) {
+      frameIndexInput.title =
+        'Frame copied out through onFrame for the .npy download. Follows the run ' +
+        'peak unless you edit it.';
+    }
 
     let returnedFrames = 0;
     let returnedBytes = 0;
     clearRetainedFrame();
-    returnedStat.value.textContent = `0 / ${config.frameCount} · 0 MB`;
+    resetRunReadouts();
+    setContractBadge(config, 'fail', 0);
+    returnedStat.value.textContent = `0 / ${config.frameCount} · 0 MiB`;
 
     logInfo('workbench', 'Starting run', {
       width: config.width,
@@ -996,8 +1401,19 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
                 pixels,
               };
               const checksum = checksumFloats(pixels);
-              keptFrameStat.value.textContent = `#${frame.meta.frameIndex} · ${checksum}`;
+              // The tile reports the scan result, so the checksum lives in the
+              // tooltip and the console until a scan runs.
+              keptFrameStat.value.textContent = `frame #${frame.meta.frameIndex} · not scanned`;
+              keptFrameStat.value.title = `Retained frame #${frame.meta.frameIndex}, FNV-1a ${checksum}`;
               downloadButton.disabled = false;
+              verifyButton.disabled = false;
+              // Point the exact check at the frame most likely to matter: the one
+              // the sampled telemetry flagged as the sequence peak.
+              verifyButton.title =
+                sampledRunPeak && sampledRunPeak.frameIndex !== frame.meta.frameIndex
+                  ? `Exact-rescan frame #${frame.meta.frameIndex} and compare with the sampled ` +
+                    `run peak (frame #${sampledRunPeak.frameIndex}).`
+                  : `Exact-rescan frame #${frame.meta.frameIndex} and compare with the sampled run peak.`;
               logInfo('workbench', 'Retained frame for download', {
                 frameIndex: frame.meta.frameIndex,
                 width: frame.meta.width,
@@ -1014,6 +1430,8 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
 
       updateTelemetry(summary.telemetry);
       setState(summary.cancelled ? 'cancelled' : 'done', summary.cancelled ? 'Cancelled' : 'Complete');
+      const returnedAll = !summary.cancelled && returnedFrames === config.frameCount;
+      setContractBadge(config, returnedAll ? 'pass' : 'fail', returnedFrames);
 
       if (summary.framesCompleted !== returnedFrames) {
         logWarn('workbench', 'onFrame count does not match completed frames', {
@@ -1023,6 +1441,10 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       }
       if (!retainedFrame) {
         keptFrameStat.value.textContent = `#${keepFrameIndex} not delivered`;
+      } else if (!retainedFrame.exactScan) {
+        // A completed run is the moment to make the offer concrete.
+        keptFrameStat.value.textContent =
+          `frame #${retainedFrame.frameIndex} · press Verify peak`;
       }
 
       logInfo('workbench', summary.cancelled ? 'Run cancelled' : 'Run complete', {
@@ -1049,6 +1471,13 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
         });
         showWarning(message);
       }
+
+      // Point the keep-frame field at the frame that actually set the run peak,
+      // so “Download frame” and “Verify peak (exact)” act on the most
+      // interesting frame without the user having to read the peak's index and
+      // type it back in. The frame itself has already been delivered, so this
+      // changes the selection for the *next* run.
+      followRunPeak(config, summary.cancelled);
     } catch (error) {
       logError('workbench', 'Run failed', error, {
         framesRequested: config.frameCount,
@@ -1094,6 +1523,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     downloadVideoButton.removeEventListener('click', onDownloadVideoClick);
     compareButton.removeEventListener('click', onCompareClick);
     downloadButton.removeEventListener('click', onDownloadClick);
+    verifyButton.removeEventListener('click', onVerifyClick);
     frameIndexInput.removeEventListener('change', onFrameIndexChange);
     container.remove();
   }
@@ -1116,6 +1546,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   downloadVideoButton.addEventListener('click', onDownloadVideoClick);
   compareButton.addEventListener('click', () => void onCompareClick());
   downloadButton.addEventListener('click', onDownloadClick);
+  verifyButton.addEventListener('click', onVerifyClick);
   frameIndexInput.addEventListener('change', onFrameIndexChange);
   updateEncoderReadout(null, false);
 
@@ -1133,7 +1564,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
 
   return {
     canvas,
-    statusEl: stats,
+    statusEl: hdrStats,
     run,
     cancel,
     updateTelemetry,

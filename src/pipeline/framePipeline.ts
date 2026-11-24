@@ -47,6 +47,7 @@ import type {
   FrameTimingBreakdown,
   FrameValueStats,
   RenderConfig,
+  SequencePeak,
   TelemetrySnapshot,
 } from '../types/frame.ts';
 import { BYTES_PER_PIXEL_F32 } from '../types/frame.ts';
@@ -54,8 +55,16 @@ import { describeLogging, logDebug, logError, logInfo, logWarn } from '../diagno
 
 /** Minimum wall-clock gap between throttled telemetry callbacks. */
 const TELEMETRY_INTERVAL_MS = 100;
-/** Pixel stride for min/max telemetry sampling (keeps the scan cheap). */
-const STATS_PIXEL_STRIDE = 16;
+/**
+ * Pixel stride for min/max telemetry sampling (keeps the scan cheap).
+ *
+ * Deliberately a prime well above a power of two: a stride that divides the row
+ * width (the old `16`, with width 1280) probes only `x % 16 === 0`, i.e. 80 fixed
+ * columns, so content narrower than the lattice can hide between them. A
+ * coprime stride drifts one column per row, turning the probe pattern into a
+ * diagonal lattice that covers both axes evenly for the same cost.
+ */
+const STATS_PIXEL_STRIDE = 1031;
 /** Number of completion timestamps used to estimate achieved FPS. */
 const FPS_WINDOW_SIZE = 30;
 /** Maximum warnings retained in a telemetry snapshot. */
@@ -183,18 +192,55 @@ function toEncoderTelemetry(tap: VideoEncoderTap): EncoderTelemetry {
 }
 
 /**
- * Samples RGB channels on a fixed pixel stride and reports the min/max plus one
- * full center pixel. Scanning every pixel would cost ~3.7M float reads per frame;
- * this keeps telemetry overhead negligible while still exposing HDR peaks.
+ * Scene-linear luminance of 100%-reference white. Matches the encoder's
+ * `REFERENCE_WHITE_NITS` (see `encoder/webCodecsTap.ts`), so the nits shown in
+ * the UI and the nits baked into the PQ output cannot disagree.
  */
-function summarizePixels(pixels: Float32Array): FrameValueStats {
+const REFERENCE_WHITE_NITS = 100;
+
+/**
+ * Clamps an RGBA index so a mismatched `width`/`height` cannot read past the
+ * payload; the centre pixel is the last one for degenerate dimensions.
+ */
+function clampIndex(index: number, length: number): number {
+  const lastPixel = Math.max(0, length - 4);
+  return Math.min(Math.max(0, index), lastPixel);
+}
+
+/**
+ * Samples RGB channels on a fixed pixel stride and reports the min/max, the
+ * linear pixel that carried the peak, and one full center pixel. Scanning every
+ * pixel would cost ~3.7M float reads per frame; this keeps telemetry overhead
+ * negligible while still exposing HDR peaks.
+ *
+ * The stride is coprime with typical widths, so successive probes land on a
+ * different column each row rather than forming a fixed column lattice. For a
+ * guaranteed-exact result, use `scanFrameExact` on a retained frame.
+ *
+ * Non-square output sizes must be passed so the `sample` pixel is the geometric
+ * centre `(width/2, height/2)`. Deriving it from the pixel count alone lands on
+ * the left edge of the middle row for any width that does not divide evenly.
+ */
+function summarizePixels(
+  pixels: Float32Array,
+  width: number,
+  height: number,
+): FrameValueStats {
   const pixelCount = Math.floor(pixels.length / 4);
   if (pixelCount === 0) {
-    return { min: 0, max: 0, sample: [0, 0, 0, 0], sampledPixels: 0 };
+    return {
+      min: 0,
+      max: 0,
+      peak: [0, 0, 0],
+      sample: [0, 0, 0, 0],
+      sampledPixels: 0,
+      pixelCount: 0,
+    };
   }
 
   let min = Number.POSITIVE_INFINITY;
   let max = Number.NEGATIVE_INFINITY;
+  let peak: readonly [number, number, number] = [0, 0, 0];
   let sampledPixels = 0;
 
   for (let pixel = 0; pixel < pixelCount; pixel += STATS_PIXEL_STRIDE) {
@@ -202,18 +248,94 @@ function summarizePixels(pixels: Float32Array): FrameValueStats {
     for (let channel = 0; channel < 3; channel++) {
       const value = pixels[base + channel];
       if (value < min) min = value;
-      if (value > max) max = value;
+      if (value > max) {
+        max = value;
+        peak = [pixels[base], pixels[base + 1], pixels[base + 2]];
+      }
     }
     sampledPixels++;
   }
 
-  const center = Math.floor(pixelCount / 2) * 4;
+  const centreX = Math.floor(width / 2);
+  const centreY = Math.floor(height / 2);
+  const centre = clampIndex((centreY * width + centreX) * 4, pixels.length);
 
   return {
     min: Number.isFinite(min) ? min : 0,
     max: Number.isFinite(max) ? max : 0,
-    sample: [pixels[center], pixels[center + 1], pixels[center + 2], pixels[center + 3]],
+    peak,
+    sample: [
+      pixels[centre],
+      pixels[centre + 1],
+      pixels[centre + 2],
+      pixels[centre + 3],
+    ],
     sampledPixels,
+    pixelCount,
+  };
+}
+
+/**
+ * Result of an exact (every-pixel) scan of one frame.
+ *
+ * This is the verification counterpart to `summarizePixels`: same questions,
+ * no sampling, intended to run once on a retained frame rather than per frame.
+ */
+export interface ExactFrameScan {
+  /** Smallest linear RGB channel value over every pixel. */
+  readonly min: number;
+  /** Largest linear RGB channel value over every pixel. */
+  readonly max: number;
+  /** Pixel index (not byte offset) that carried `max`. */
+  readonly peakPixelIndex: number;
+  /** Column of `peakPixelIndex`, derived from `width`. */
+  readonly peakX: number;
+  /** Row of `peakPixelIndex`, derived from `width`. */
+  readonly peakY: number;
+  /** Wall-clock milliseconds the scan took. */
+  readonly elapsedMs: number;
+}
+
+/**
+ * Scans every RGB channel of a tightly packed RGBA float frame.
+ *
+ * Cost is one pass over `width * height * 3` floats (~3 ms for 720p measured
+ * on a desktop CPU), so this is for one-off verification of a sampled result,
+ * never the per-frame telemetry path. It also reports *where* the peak was,
+ * which makes an unexpected value (or a sampler miss) diagnosable instead of
+ * just a number to trust.
+ *
+ * @param pixels - Tightly packed RGBA float32 pixels, no row padding.
+ * @param width - Row width in pixels; used to convert the peak index to x/y.
+ * @returns Exact min/max plus the location and duration of the scan.
+ */
+export function scanFrameExact(pixels: Float32Array, width: number): ExactFrameScan {
+  const startedAt = performance.now();
+  const pixelCount = Math.floor(pixels.length / 4);
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  let peakPixelIndex = 0;
+
+  for (let pixel = 0; pixel < pixelCount; pixel++) {
+    const base = pixel * 4;
+    for (let channel = 0; channel < 3; channel++) {
+      const value = pixels[base + channel];
+      if (value < min) min = value;
+      if (value > max) {
+        max = value;
+        peakPixelIndex = pixel;
+      }
+    }
+  }
+
+  const safeWidth = width > 0 ? width : pixelCount;
+  return {
+    min: Number.isFinite(min) ? min : 0,
+    max: Number.isFinite(max) ? max : 0,
+    peakPixelIndex,
+    peakX: pixelCount > 0 ? peakPixelIndex % safeWidth : 0,
+    peakY: pixelCount > 0 ? Math.floor(peakPixelIndex / safeWidth) : 0,
+    elapsedMs: performance.now() - startedAt,
   };
 }
 
@@ -264,8 +386,10 @@ export async function runFramePipeline(
   let averageFrameMs = 0;
   let measuredFps = 0;
   let readbackBytes = 0;
+  let stagingBytes = 0;
   let retainedBytes = 0;
   let lastFrameValues: FrameValueStats | undefined;
+  let sequencePeak: SequencePeak | undefined;
   let renderFormat: GPUTextureFormat | undefined;
   let lastTelemetryAt = Number.NEGATIVE_INFINITY;
   let cancelled = false;
@@ -306,14 +430,21 @@ export async function runFramePipeline(
       lastFrameMs,
       averageFrameMs,
       readbackBytes,
+      // Staging geometry is only known once the readback manager exists, so it
+      // reports 0 for the initial (pre-init) telemetry sample.
+      readbackPerFrameBytes: readbackManager?.bufferSize ?? 0,
       // Released frames are not retained. A shared output buffer is retained by
       // design and reported here so the cost of `reuseOutputBuffer` is visible.
       retainedBytes,
+      // Constant per run: the MAP_READ ring is allocated up front and recycled,
+      // so this is allocated memory, not a running total of copied bytes.
+      stagingBytes,
       warnings: warnings.slice(),
       lastFrameIndex,
       elapsedMs: performance.now() - runStart,
       renderFormat,
       lastFrameValues,
+      sequencePeak,
       lastFrameTimings,
       averageFrameTimings,
       encoder: encoder ? toEncoderTelemetry(encoder) : undefined,
@@ -532,10 +663,30 @@ export async function runFramePipeline(
       const readbackMs = readback?.waitMs ?? 0;
       const unpackMs = readback?.unpackMs ?? 0;
 
-      lastFrameValues = summarizePixels(rawFrame.pixels);
+      lastFrameValues = summarizePixels(rawFrame.pixels, config.width, config.height);
       framesCompleted++;
       lastFrameIndex = item.frameIndex;
       readbackBytes = framesCompleted * manager.bufferSize;
+
+      // Keep the brightest sample of the whole run, not just the current frame:
+      // the shapes' opacity animates, so the composited peak moves between frames
+      // and the final frame is not a reliable indicator that the run was HDR.
+      // `SequencePeak` is immutable, so each update replaces it wholesale rather
+      // than mutating a flag on the previous value.
+      const previousPeak = sequencePeak;
+      const peakIsThisFrame =
+        previousPeak === undefined || lastFrameValues.max >= previousPeak.value;
+      sequencePeak = {
+        value: peakIsThisFrame ? lastFrameValues.max : previousPeak.value,
+        frameIndex: peakIsThisFrame ? item.frameIndex : previousPeak.frameIndex,
+        nits: peakIsThisFrame ? lastFrameValues.max * REFERENCE_WHITE_NITS : previousPeak.nits,
+        whiteNits: REFERENCE_WHITE_NITS,
+        coverage: peakIsThisFrame
+          ? lastFrameValues.sampledPixels / lastFrameValues.pixelCount
+          : previousPeak.coverage,
+        rgb: peakIsThisFrame ? lastFrameValues.peak : previousPeak.rgb,
+        lastFrameValuesIsPeak: peakIsThisFrame,
+      };
 
       completionTimes.push(performance.now());
       if (completionTimes.length > FPS_WINDOW_SIZE + 1) {
@@ -721,6 +872,7 @@ export async function runFramePipeline(
     retainedBytes = manager.reuseOutputBuffer
       ? config.width * config.height * BYTES_PER_PIXEL_F32
       : 0;
+    stagingBytes = manager.bufferSize * manager.stagingBufferCount;
 
     logInfo('pipeline', 'Resources ready', {
       renderFormat,
@@ -728,6 +880,7 @@ export async function runFramePipeline(
       maxFramesInFlight,
       reuseOutputBuffer: manager.reuseOutputBuffer,
       bufferMiB: Number((manager.bufferSize / (1024 * 1024)).toFixed(2)),
+      stagingMiB: Number((stagingBytes / (1024 * 1024)).toFixed(2)),
       retainedMiB: Number((retainedBytes / (1024 * 1024)).toFixed(2)),
     });
 
