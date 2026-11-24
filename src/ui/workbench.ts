@@ -33,6 +33,7 @@ import { createVideoEncoderTap, flushAndClose } from '../encoder/webCodecsTap.ts
 import type { VideoEncoderTap } from '../encoder/webCodecsTap.ts';
 import { canMuxVideo, muxVideo } from '../encoder/videoContainer.ts';
 import type { MuxedVideoFile, MuxVideoChunk } from '../encoder/videoContainer.ts';
+import { renderComparisonFrame } from '../encoder/videoComparison.ts';
 import { describeLogging, logDebug, logError, logInfo, logWarn } from '../diagnostics/logger.ts';
 
 const DEFAULT_WIDTH = 1280;
@@ -320,6 +321,8 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   let muxedVideo: MuxedVideoFile | null = null;
   let muxedTransfer: 'pq' | 'hlg' = 'pq';
   let videoObjectUrl: string | null = null;
+  let muxedBlob: Blob | null = null;
+  let showingComparison = false;
 
   // --- Header ----------------------------------------------------------------
   const container = createElement('div', 'workbench');
@@ -385,7 +388,14 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   const downloadVideoButton = createElement('button', 'wb-button', 'Download video');
   downloadVideoButton.type = 'button';
   downloadVideoButton.disabled = true;
-  downloadVideoButton.title = 'Download the muxed MP4 produced by “Export HDR video”';
+  downloadVideoButton.title = 'Download the muxed file produced by “Export HDR video”';
+
+  const compareButton = createElement('button', 'wb-button', 'Compare like preview');
+  compareButton.type = 'button';
+  compareButton.disabled = true;
+  compareButton.title =
+    'Show the exported frame tone-mapped with the preview\'s own ACES + sRGB curve, ' +
+    'so the two are directly comparable (raw PQ looks far too dark on an SDR display)';
 
   controls.append(
     formatField,
@@ -395,6 +405,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     downloadButton,
     exportButton,
     downloadVideoButton,
+    compareButton,
   );
   header.append(headingGroup, stateBadge);
 
@@ -412,7 +423,15 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   videoPreview.muted = true;
   videoPreview.hidden = true;
 
-  stage.append(canvas, videoPreview);
+  // Shows the exported frame passed through the *preview's own* ACES+sRGB curve,
+  // so it is directly comparable with the live preview instead of looking far
+  // too dark (PQ shown on an SDR display without a tone curve).
+  const comparisonCanvas = createElement('canvas', 'wb-canvas');
+  comparisonCanvas.width = DEFAULT_WIDTH;
+  comparisonCanvas.height = DEFAULT_HEIGHT;
+  comparisonCanvas.hidden = true;
+
+  stage.append(canvas, videoPreview, comparisonCanvas);
 
   // --- Telemetry -------------------------------------------------------------
   const stats = createElement('dl', 'wb-stats');
@@ -499,6 +518,60 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       bytes: retainedFrame.pixels.byteLength,
     });
     downloadNpyFrame(retainedFrame);
+  }
+
+  /**
+   * Renders the exported frame through the preview's own tone curve so the two
+   * images are comparable. Toggles back to the raw player on a second press.
+   */
+  async function onCompareClick(): Promise<void> {
+    if (!muxedVideo || !muxedBlob) return;
+
+    if (showingComparison) {
+      showingComparison = false;
+      comparisonCanvas.hidden = true;
+      videoPreview.hidden = false;
+      compareButton.textContent = 'Compare like preview';
+      return;
+    }
+
+    compareButton.disabled = true;
+    compareButton.textContent = 'Comparing…';
+    try {
+      const keepIndex = Math.min(
+        muxedVideo.frameCount - 1,
+        Math.max(0, Math.floor(Number.parseInt(frameIndexInput.value, 10) || 0)),
+      );
+      const image = await renderComparisonFrame(
+        muxedBlob,
+        keepIndex,
+        muxedVideo.frameCount,
+        DEFAULT_FPS,
+      );
+
+      comparisonCanvas.width = image.width;
+      comparisonCanvas.height = image.height;
+      const context = comparisonCanvas.getContext('2d');
+      if (!context) throw new Error('2D context unavailable');
+      context.putImageData(new ImageData(image.pixels, image.width, image.height), 0, 0);
+
+      comparisonCanvas.hidden = false;
+      videoPreview.hidden = true;
+      showingComparison = true;
+      compareButton.textContent = `Show raw PQ (frame ${keepIndex})`;
+      logInfo('workbench', 'Rendered preview-matched comparison frame', {
+        frameIndex: keepIndex,
+        width: image.width,
+        height: image.height,
+        note: 'exported frames tone-mapped with the preview ACES+sRGB curve',
+      });
+    } catch (error) {
+      logError('workbench', 'Comparison render failed', error);
+      showWarning(`Comparison failed: ${describeError(error)}`);
+      compareButton.textContent = 'Compare like preview';
+    } finally {
+      compareButton.disabled = false;
+    }
   }
 
   function onDownloadVideoClick(): void {
@@ -675,13 +748,13 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
             muxedVideo = produced;
             muxedTransfer = config.outputColorSpace.transfer === 'hlg' ? 'hlg' : 'pq';
             downloadVideoButton.disabled = false;
+            compareButton.disabled = false;
 
             // One blob URL shared by the in-page player and the save button, so
             // the (potentially multi-MB) file is not copied twice.
             if (videoObjectUrl) URL.revokeObjectURL(videoObjectUrl);
-            videoObjectUrl = URL.createObjectURL(
-              new Blob([produced.buffer], { type: produced.mimeType }),
-            );
+            muxedBlob = new Blob([produced.buffer], { type: produced.mimeType });
+            videoObjectUrl = URL.createObjectURL(muxedBlob);
             videoPreview.src = videoObjectUrl;
             videoPreview.hidden = false;
             canvas.hidden = true;
@@ -1011,6 +1084,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     startButton.removeEventListener('click', onStartClick);
     cancelButton.removeEventListener('click', onCancelClick);
     downloadVideoButton.removeEventListener('click', onDownloadVideoClick);
+    compareButton.removeEventListener('click', onCompareClick);
     downloadButton.removeEventListener('click', onDownloadClick);
     frameIndexInput.removeEventListener('change', onFrameIndexChange);
     container.remove();
@@ -1032,6 +1106,7 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   cancelButton.addEventListener('click', onCancelClick);
   exportButton.addEventListener('click', onExportClick);
   downloadVideoButton.addEventListener('click', onDownloadVideoClick);
+  compareButton.addEventListener('click', () => void onCompareClick());
   downloadButton.addEventListener('click', onDownloadClick);
   frameIndexInput.addEventListener('change', onFrameIndexChange);
   updateEncoderReadout(null, false);
