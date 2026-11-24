@@ -1,10 +1,10 @@
 # hdr-frame-poc
 
-> **Note:** this README is working notes, not a specification. It records what
-> was built and attempted during development and is expected to drift out of
-> date. Do not treat it as a guide to how this project should work — the
-> requirements live in `Assignment.md`. This file will be rewritten before it is
-> submitted as the assignment's README.
+> **Note:** this file is working notes, not a specification. It records what was
+> built and attempted during development and is expected to drift out of date.
+> Do not treat it as a guide to how this project should work — the requirements
+> live in `Assignment.md`, and the final assignment write-up lives in
+> `README.md`.
 
 ## Diagnostics
 
@@ -50,8 +50,8 @@ turns band edges into fine texture rather than hard steps.
 
 ## Implementation notes (draft)
 
-These notes capture decisions and known limitations while they are fresh; this
-section will be expanded into the final README.
+These notes capture decisions and known limitations while they are fresh; the
+final write-up lives in `README.md`.
 
 ### Rendering approach
 
@@ -71,7 +71,7 @@ section will be expanded into the final README.
 - An optional WebCodecs tap converts each float frame to `I420P10` (or 8-bit
   `I420`/`RGBA` fallback) and feeds a 10-bit Rec. 2100 PQ/HLG `VideoEncoder`.
 
-### Decisions to explain in the final README
+### Decisions documented in the final README
 
 - **WebGPU over WebGL/Canvas 2D:** first-class float render targets, explicit
   texture formats, deterministic command ordering, and no 8-bit canvas
@@ -85,20 +85,22 @@ section will be expanded into the final README.
   download (shape `(720, 1280, 4)`, little-endian float32, C order) so the
   returned data can be inspected with NumPy.
 - **Colour/nits:** a scene-linear value of 1.0 maps to 100 nits; PQ normalizes
-  to 10 000 nits and HLG to a 1 000-nit reference. Authored colors peak around
-  560 nits. These conventions need an explicit README explanation.
+  to 10 000 nits and HLG to a 1 000-nit reference. Authored shape colors peak at
+  3.6-5.6 scene-linear (360-560 nits) before opacity. These conventions are
+  documented in `README.md`.
 - **SDR preview is an estimate:** it applies tone mapping and sRGB encoding but
   does not yet perform a Rec. 2020 -> Rec. 709 gamut conversion, so highly
   saturated Rec. 2020 colors are not a colour-managed SDR rendering.
 - **Encoder metadata:** the tap tags each `VideoFrame` with Rec. 2020 / PQ or
   HLG / `bt2020-ncl`; the encoder is configured for a 10-bit profile. Chunks are
-  currently counted but not muxed.
+  counted and passed to the hand-written MP4/WebM muxers.
 
 ### Browser limitations and risks
 
-- The WebCodecs `VideoFrame(BufferSource, ...)` constructor accepts only 8-bit
-  formats in current browsers, so true 10-bit input is unavailable without a
-  WASM/native encoder (or externally decoded 10-bit frames).
+- Current Chrome's WebCodecs `VideoFrame(BufferSource, ...)` constructor rejects
+  10-bit formats (the tap probes `I420P10` first and falls back), so true 10-bit
+  source input is unavailable without a WASM/native encoder (or externally
+  decoded 10-bit frames).
 - WebGPU requires a secure context and a supported browser/OS. Device loss,
   adapter loss, and uncaptured validation/OOM errors are handled as diagnostics;
   a lost device can still leave an in-flight readback waiting.
@@ -116,8 +118,9 @@ section will be expanded into the final README.
   deterministic because it never depends on wall-clock time.
 - Large readbacks and float expansions create GC/memory pressure; the staging
   ring and `reuseOutputBuffer` option bound the pipeline's own allocations.
-- No muxer yet, so no container-level `colr`/`mdcv`/`clli` boxes and no
-  downloadable HDR video.
+- The muxers write primaries/transfer/matrix/range (`colr`/`Colour`) and the
+  exported file is downloadable and playable in supported browsers, but
+  `mdcv`/`clli` (mastering-display and content-light) metadata is not written.
 
 ### Optimisation roadmap
 
@@ -142,16 +145,16 @@ section will be expanded into the final README.
 - No automated tests yet. Good candidates: matrix composition, timeline
   determinism/loop seam, half-float decode, I420/RGBA packers, and an end-to-end
   browser run asserting 300 `onFrame` deliveries and HDR values above 1.0.
-- Muxing the encoder output (for example with `mp4-muxer`) and verifying the
-  color metadata in the resulting file is the next functional milestone beyond
-  the core frame-generation brief.
+- The encoder output is muxed by the hand-written MP4/WebM writers. Verifying
+  the colour metadata in files from more players, and adding `mdcv`/`clli`, are
+  the remaining container-level improvements.
 
 ### Open items
 
 - [x] Deliver Float32 frames through `onFrame`, count them in the UI, retain one
   selected frame and download it as `.npy`.
 - [ ] Add automated unit/end-to-end tests and CI.
-- [ ] Mux 10-bit HDR chunks into a playable MP4/WebM and inspect the colour
+- [x] Mux 10-bit HDR chunks into a playable MP4/WebM and inspect the colour
   metadata that reaches the container.
 - [ ] Add a Rec. 2020 -> Rec. 709 gamut matrix to the SDR preview (and document
   the tone curve).
@@ -159,7 +162,7 @@ section will be expanded into the final README.
 - [ ] Fail the run promptly on GPU device loss and reject in-flight readbacks.
 - [ ] Render text (Canvas 2D/SDF source, linearized and scaled into HDR range).
 - [ ] Investigate/present HDR output accurately where the browser supports it.
-- [ ] Write the final README (this draft is the source material).
+- [x] Write the final README (this draft is the source material).
 
 ### Telemetry sampling and verification
 
