@@ -12,6 +12,9 @@
  * - **Premultiplied alpha:** shape fragments emit `rgb * opacity` with alpha
  *   `opacity`, and the pipeline blends `one` / `one-minus-src-alpha`. This avoids
  *   dark fringes when translucent shapes composite over HDR values.
+ * - **Edge antialiasing:** shape coverage is computed analytically from
+ *   `fwidth(localUv)` in the fragment shader and folded into premultiplied alpha,
+ *   so rotated/skewed quads have smooth edges without an MSAA resolve pass.
  * - **Coordinate spaces:** the CPU composes shape-local -> design pixels ->
  *   WebGPU NDC via `composeShapeClipMatrix`, so pixel orientation is resolved in
  *   one place (design space is top-left/+Y down; NDC is +Y up).

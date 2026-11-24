@@ -23,6 +23,10 @@
 //   a `one` / `one-minus-src-alpha` blend state, which avoids dark fringes when
 //   translucent shapes composite over HDR values.
 // - The background is opaque and also written premultiplied for consistency.
+// - Shape edges use analytic coverage computed from `fwidth(localUv)` instead of
+//   MSAA. Coverage fades over roughly one pixel regardless of rotation, scale,
+//   or skew, and multiplies into the premultiplied color so edge pixels blend
+//   correctly with whatever is behind them.
 
 struct BackgroundUniforms {
   // `from` is a reserved word in WGSL (see WGSL spec §16.2), so the gradient
@@ -100,8 +104,23 @@ fn vsShape(@builtin(vertex_index) vertexIndex: u32) -> ShapeOut {
 
 @fragment
 fn fsShape(in: ShapeOut) -> @location(0) vec4<f32> {
+  // Analytic antialiasing for the quad's four edges. `localUv` is 0..1 across
+  // the quad; its screen-space derivative is the UV footprint of one pixel, so
+  // `edgeDistance / footprint` is the fraction of the pixel covered by the
+  // shape. Doing this per-axis and taking the minimum also handles the corner
+  // regions, where two edges are close. The result is deterministic (derived
+  // from rasterization, not a random/sample pattern) and avoids needing an MSAA
+  // target, which would force a resolve before readback and encode.
+  let edgeDistance = min(in.localUv, vec2<f32>(1.0) - in.localUv);
+  let pixelFootprint = max(fwidth(in.localUv), vec2<f32>(1.0e-6));
+  let coverage = clamp(
+    min(edgeDistance.x / pixelFootprint.x, edgeDistance.y / pixelFootprint.y),
+    0.0,
+    1.0,
+  );
+
   // Flat linear HDR fill; opacity comes from `.a`. Premultiply so the
   // one / one-minus-src-alpha blend state composites correctly over HDR.
-  let alpha = clamp(shape.color.a, 0.0, 1.0);
+  let alpha = clamp(shape.color.a, 0.0, 1.0) * coverage;
   return vec4<f32>(shape.color.rgb * alpha, alpha);
 }

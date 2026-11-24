@@ -31,12 +31,23 @@ import { getWorkingColorSpace } from '../timeline/sceneAnimator.ts';
 import { runFramePipeline } from '../pipeline/framePipeline.ts';
 import { createVideoEncoderTap, flushAndClose } from '../encoder/webCodecsTap.ts';
 import type { VideoEncoderTap } from '../encoder/webCodecsTap.ts';
+import { muxVideoToMp4, canMuxCodec } from '../encoder/mp4Muxer.ts';
+import type { MuxedVideo, MuxVideoChunk } from '../encoder/mp4Muxer.ts';
 import { describeLogging, logDebug, logError, logInfo, logWarn } from '../diagnostics/logger.ts';
 
 const DEFAULT_WIDTH = 1280;
 const DEFAULT_HEIGHT = 720;
 const DEFAULT_FPS = 30;
 const DEFAULT_FRAME_COUNT = 300;
+
+/**
+ * Codecs the export pass is allowed to select, in preference order.
+ *
+ * Constrained deliberately: encoding with a codec the MP4 muxer cannot carry
+ * (notably VP9, which Firefox may prefer) wastes a full encode pass and then
+ * fails at the container step. HEVC and AV1 both map cleanly onto MP4.
+ */
+const EXPORT_CODEC_CANDIDATES = ['hvc1.2.4.L93.B0', 'av01.0.08M.10'] as const;
 
 /** Fixed run parameters plus the user-selectable HDR target format. */
 export interface WorkbenchRunOptions {
@@ -81,6 +92,9 @@ interface StatCell {
   readonly cell: HTMLDivElement;
   readonly value: HTMLElement;
 }
+
+/** One encoded chunk plus the metadata WebCodecs emitted alongside it. */
+interface CollectedVideoChunk extends MuxVideoChunk {}
 
 /** One completed CPU frame copied out of the streaming pipeline for download. */
 interface RetainedFrame {
@@ -194,6 +208,24 @@ function downloadNpyFrame(frame: RetainedFrame): void {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+/**
+ * Downloads a muxed HDR video.
+ *
+ * The filename records the container, codec family, and transfer function,
+ * because those three facts are what determine whether a player shows it as HDR.
+ */
+function downloadMuxedVideo(video: MuxedVideo, transfer: 'pq' | 'hlg', url?: string): void {
+  const objectUrl = url ?? URL.createObjectURL(new Blob([video.buffer], { type: video.mimeType }));
+  const link = document.createElement('a');
+  link.href = objectUrl;
+  link.download =
+    `hdr-${video.frameCount}f-rec2020-${transfer}-${video.codecFamily}.${video.extension}`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  if (!url) setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+}
+
 /** Rec. 2100 PQ delivery space used as the default output description. */
 function getRec2100PqColorSpace(): ColorSpaceSpec {
   return {
@@ -280,6 +312,9 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   let unmounted = false;
   let activeController: AbortController | null = null;
   let retainedFrame: RetainedFrame | null = null;
+  let muxedVideo: MuxedVideo | null = null;
+  let muxedTransfer: 'pq' | 'hlg' = 'pq';
+  let videoObjectUrl: string | null = null;
 
   // --- Header ----------------------------------------------------------------
   const container = createElement('div', 'workbench');
@@ -312,19 +347,15 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   cancelButton.type = 'button';
   cancelButton.disabled = true;
 
-  const encoderField = createElement('label', 'wb-field wb-field--inline');
-  const encoderToggle = document.createElement('input');
-  encoderToggle.type = 'checkbox';
-  encoderToggle.className = 'wb-checkbox';
-  encoderToggle.checked = false;
-  encoderToggle.disabled = !webCodecsAvailable;
+  const exportButton = createElement('button', 'wb-button', 'Export HDR video');
+  exportButton.type = 'button';
+  exportButton.disabled = !webCodecsAvailable;
+  exportButton.title =
+    'Re-render all frames deterministically and encode them offline (no live preview). ' +
+    'Rendering is a pure function of the frame index, so the exported frames match the preview run.';
   if (!webCodecsAvailable) {
-    encoderToggle.title = 'WebCodecs VideoEncoder is not available in this browser.';
+    exportButton.title = 'WebCodecs VideoEncoder is not available in this browser.';
   }
-  encoderField.append(
-    encoderToggle,
-    createElement('span', 'wb-field-label', 'WebCodecs encode'),
-  );
 
   const frameField = createElement('label', 'wb-field');
   const frameIndexInput = document.createElement('input');
@@ -346,13 +377,19 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   downloadButton.title =
     'Download the kept frame as .npy (H×W×4 float32, linear Rec.2020)';
 
+  const downloadVideoButton = createElement('button', 'wb-button', 'Download video');
+  downloadVideoButton.type = 'button';
+  downloadVideoButton.disabled = true;
+  downloadVideoButton.title = 'Download the muxed MP4 produced by “Export HDR video”';
+
   controls.append(
     formatField,
-    encoderField,
     frameField,
     startButton,
     cancelButton,
     downloadButton,
+    exportButton,
+    downloadVideoButton,
   );
   header.append(headingGroup, stateBadge);
 
@@ -361,7 +398,16 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
   const canvas = createElement('canvas', 'wb-canvas');
   canvas.width = DEFAULT_WIDTH;
   canvas.height = DEFAULT_HEIGHT;
-  stage.append(canvas);
+
+  // Plays the muxed export in place once it exists, so "did the file actually
+  // decode?" is answered without leaving the page.
+  const videoPreview = createElement('video', 'wb-video');
+  videoPreview.controls = true;
+  videoPreview.playsInline = true;
+  videoPreview.muted = true;
+  videoPreview.hidden = true;
+
+  stage.append(canvas, videoPreview);
 
   // --- Telemetry -------------------------------------------------------------
   const stats = createElement('dl', 'wb-stats');
@@ -406,10 +452,9 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     'Frames are streamed: each Float32 frame (~14.75 MB at 1280×720) is delivered through ' +
       'onFrame and released afterwards; only the selected frame is copied for download, so a ' +
       '300-frame run never retains all frames (~4.4 GB if it did). “Download frame” saves the ' +
-      'kept frame as .npy (H×W×4 float32, linear Rec.2020). Enable WebCodecs encode to pack ' +
-      'each frame as I420P10 (RGBA fallback) and feed a Rec. 2100 PQ/HLG encoder; chunk counts ' +
-      'and bytes are tracked here, with muxing left to a future phase. 10-bit encoder input ' +
-      'requires the browser to expose I420P10 VideoFrames; otherwise the tap falls back to 8-bit RGBA.',
+      'kept frame as .npy (H×W×4 float32, linear Rec.2020). Rendering is render-only: ' +
+      '“Export HDR video” re-renders the same deterministic timeline headlessly and encodes it ' +
+      'offline as I420P10 (I420/RGBA fallback), so encoding never slows the live preview.',
   );
 
   // Expected capability fallbacks (currently the 8-bit RGBA input path) belong
@@ -451,8 +496,237 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     downloadNpyFrame(retainedFrame);
   }
 
+  function onDownloadVideoClick(): void {
+    if (!muxedVideo) return;
+    logInfo('workbench', 'Downloading muxed HDR video', {
+      bytes: muxedVideo.buffer.byteLength,
+      frameCount: muxedVideo.frameCount,
+      codecFamily: muxedVideo.codecFamily,
+      container: muxedVideo.extension,
+      transfer: muxedTransfer,
+      durationSeconds: Number(muxedVideo.durationSeconds.toFixed(3)),
+    });
+    downloadMuxedVideo(muxedVideo, muxedTransfer, videoObjectUrl ?? undefined);
+  }
+
   function onFrameIndexChange(): void {
     if (!running) clearRetainedFrame();
+  }
+
+  /**
+   * Encodes the whole timeline offline in a headless pass.
+   *
+   * Rendering is a pure function of the frame index, so re-rendering produces the
+   * same pixels the preview pass showed. Running it separately keeps encoding cost
+   * and back-pressure out of the interactive preview entirely.
+   */
+  async function exportVideo(): Promise<void> {
+    if (running || unmounted || !webCodecsAvailable) return;
+    if (!webgpuAvailable) {
+      showWarning('WebGPU is not available; cannot export.');
+      return;
+    }
+
+    running = true;
+    startButton.disabled = true;
+    exportButton.disabled = true;
+    cancelButton.disabled = false;
+    formatSelect.disabled = true;
+    frameIndexInput.disabled = true;
+    showWarning('');
+    setState('running', 'Exporting');
+
+    const controller = new AbortController();
+    activeController = controller;
+    const runStart = performance.now();
+
+    const selection: WorkbenchRunOptions = {
+      width: DEFAULT_WIDTH,
+      height: DEFAULT_HEIGHT,
+      fps: DEFAULT_FPS,
+      frameCount: DEFAULT_FRAME_COUNT,
+      renderFormat: formatSelect.value === 'rgba32float' ? 'rgba32float' : 'rgba16float',
+    };
+    const config = createConfig(selection);
+
+    const videoChunks: CollectedVideoChunk[] = [];
+    let encoderTap: VideoEncoderTap | null = null;
+
+    encoderStat.value.textContent = 'Starting…';
+    chunksStat.value.textContent = '—';
+    encoderNote.hidden = true;
+    encoderNote.textContent = '';
+
+    try {
+      logInfo('workbench', 'Creating VideoEncoder tap for offline export', {
+        width: config.width,
+        height: config.height,
+        fps: config.fps,
+        transfer: config.outputColorSpace.transfer,
+      });
+
+      encoderTap = await createVideoEncoderTap(
+        createEncoderProbeMeta(config),
+        (chunk, metadata) => {
+          videoChunks.push({ chunk, metadata });
+        },
+        {
+          // Constrain selection to codecs the MP4 muxer can carry.
+          codecs: EXPORT_CODEC_CANDIDATES,
+          transfer: config.outputColorSpace.transfer === 'hlg' ? 'hlg' : 'pq',
+          onWarning: (message) => {
+            showWarning(`Video encoder: ${message}`);
+          },
+          onInfo: (message) => {
+            encoderNote.hidden = false;
+            encoderNote.textContent = message;
+          },
+          onError: (error) => {
+            showWarning(`Video encoder: ${error.message}`);
+          },
+        },
+      );
+
+      if (!encoderTap) {
+        logInfo('workbench', 'No VideoEncoder tap available; export aborted');
+        if (warningEl.hidden) {
+          showWarning(
+            'No supported 10-bit HDR VideoEncoder profile; nothing to export.',
+          );
+        }
+        setState('error', 'Unsupported');
+        updateEncoderReadout(null, true);
+        return;
+      }
+
+      const tap = encoderTap;
+
+      // Backstop: even with a constrained candidate list, never start a full
+      // encode pass whose output the muxer cannot carry. Failing here keeps the
+      // error attributable to codec selection rather than the container writer.
+      if (!canMuxCodec(tap.codec)) {
+        logWarn('workbench', 'Export codec cannot be muxed; aborting before encode', {
+          codec: tap.codec,
+        });
+        showWarning(
+          `The selected encoder (${tap.codec}) cannot be written to MP4. ` +
+            'Export requires HEVC or AV1; see the console “Codec probe results” log.',
+        );
+        setState('error', 'Unsupported');
+        updateEncoderReadout(tap.status(), true);
+        return;
+      }
+
+      logInfo('workbench', 'VideoEncoder tap ready for export', {
+        codec: tap.codec,
+        frameFormat: tap.frameFormat,
+        state: tap.status().state,
+      });
+
+      const summary = await runFramePipeline({
+        config,
+        // Headless: no preview canvas, so export does not touch the swap chain.
+        previewCanvas: null,
+        signal: controller.signal,
+        encoderTap: tap,
+        callbacks: {
+          onTelemetry: (snapshot) => {
+            updateTelemetry(snapshot);
+            chunksStat.value.textContent =
+              `${videoChunks.length} chunks · ${formatMegabytes(tap.status().chunkBytes)} MB`;
+          },
+          onWarning: showWarning,
+        },
+      });
+
+      updateEncoderReadout(tap.status(), true);
+      setState(summary.cancelled ? 'cancelled' : 'done', summary.cancelled ? 'Cancelled' : 'Complete');
+
+      logInfo('workbench', 'Export complete', {
+        framesEncoded: summary.framesCompleted,
+        chunks: videoChunks.length,
+        chunkBytes: tap.status().chunkBytes,
+        keyFrames: tap.status().keyFrames,
+        codec: tap.codec,
+        frameFormat: tap.frameFormat,
+        elapsedMs: Math.round(summary.elapsedMs),
+      });
+
+      if (!summary.cancelled && videoChunks.length > 0) {
+        // Muxing is synchronous and cheap (~a few MB of memcpy), and it needs the
+        // whole chunk list, so it runs after the encode pass finishes.
+        try {
+          const produced = muxVideoToMp4({
+            chunks: videoChunks,
+            codec: tap.codec,
+            width: config.width,
+            height: config.height,
+            fps: config.fps,
+            transfer: config.outputColorSpace.transfer === 'hlg' ? 'hlg' : 'pq',
+          });
+
+          if (produced) {
+            muxedVideo = produced;
+            muxedTransfer = config.outputColorSpace.transfer === 'hlg' ? 'hlg' : 'pq';
+            downloadVideoButton.disabled = false;
+
+            // One blob URL shared by the in-page player and the save button, so
+            // the (potentially multi-MB) file is not copied twice.
+            if (videoObjectUrl) URL.revokeObjectURL(videoObjectUrl);
+            videoObjectUrl = URL.createObjectURL(
+              new Blob([produced.buffer], { type: produced.mimeType }),
+            );
+            videoPreview.src = videoObjectUrl;
+            videoPreview.hidden = false;
+            canvas.hidden = true;
+
+            const megabytes = (produced.buffer.byteLength / (1024 * 1024)).toFixed(2);
+            chunksStat.value.textContent =
+              `${produced.frameCount} frames · ${megabytes} MB ${produced.extension.toUpperCase()} · ` +
+              `${produced.codecFamily}/${muxedTransfer}`;
+            logInfo('workbench', 'Muxed HDR video', {
+              container: produced.extension,
+              codecFamily: produced.codecFamily,
+              transfer: muxedTransfer,
+              frames: produced.frameCount,
+              bytes: produced.buffer.byteLength,
+              durationSeconds: Number(produced.durationSeconds.toFixed(3)),
+            });
+            showWarning('');
+          } else {
+            showWarning('Export finished but produced no muxable chunks.');
+          }
+        } catch (error) {
+          // A mux failure must not hide the fact that encoding succeeded.
+          logError('workbench', 'Muxing encoded chunks failed', error, {
+            chunks: videoChunks.length,
+            codec: tap.codec,
+          });
+          showWarning(`Video mux failed: ${describeError(error)}`);
+        }
+      } else if (!summary.cancelled) {
+        showWarning('Export finished but produced no encoded chunks.');
+      }
+    } catch (error) {
+      logError('workbench', 'Export failed', error, {
+        elapsedMs: Math.round(performance.now() - runStart),
+      });
+      setState('error', 'Error');
+      showWarning(`Export failed: ${describeError(error)}`);
+    } finally {
+      await flushAndClose(encoderTap);
+      if (encoderTap) updateEncoderReadout(encoderTap.status(), true);
+
+      if (activeController === controller) activeController = null;
+      running = false;
+      if (!unmounted) {
+        startButton.disabled = !webgpuAvailable;
+        cancelButton.disabled = true;
+        formatSelect.disabled = false;
+        frameIndexInput.disabled = false;
+        exportButton.disabled = !webCodecsAvailable;
+      }
+    }
   }
 
   /**
@@ -529,7 +803,9 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     retainedStat.value.textContent = `${formatMegabytes(snapshot.retainedBytes)} MB`;
     if (snapshot.renderFormat) targetStat.value.textContent = snapshot.renderFormat;
 
-    updateEncoderReadout(snapshot.encoder ?? null, encoderToggle.checked);
+    if (snapshot.encoder) {
+      updateEncoderReadout(snapshot.encoder, true);
+    }
 
     if (snapshot.warnings.length > 0) {
       showWarning(snapshot.warnings.join('\n'));
@@ -551,7 +827,6 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     startButton.disabled = true;
     cancelButton.disabled = false;
     formatSelect.disabled = true;
-    encoderToggle.disabled = true;
     frameIndexInput.disabled = true;
     showWarning('');
     setState('running', 'Running');
@@ -568,7 +843,6 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       renderFormat: formatSelect.value === 'rgba32float' ? 'rgba32float' : 'rgba16float',
     };
     const config = createConfig(selection);
-    const wantEncoder = encoderToggle.checked && webCodecsAvailable;
 
     const requestedKeepIndex = Number.parseInt(frameIndexInput.value, 10);
     const keepFrameIndex = Number.isFinite(requestedKeepIndex)
@@ -588,7 +862,6 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       fps: config.fps,
       frameCount: config.frameCount,
       renderFormat: config.renderFormat,
-      encoderRequested: wantEncoder,
       webCodecsAvailable,
       logging: describeLogging(),
     });
@@ -597,88 +870,27 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     // be set before the pipeline creates the preview renderer.
     canvas.width = config.width;
     canvas.height = config.height;
+    // A fresh render replaces any previously exported video in the stage.
+    videoPreview.hidden = true;
+    videoPreview.removeAttribute('src');
+    canvas.hidden = false;
     targetStat.value.textContent = selection.renderFormat;
-    encoderStat.value.textContent = wantEncoder ? 'Starting…' : 'Off';
+    encoderStat.value.textContent = 'Not used (offline export only)';
     chunksStat.value.textContent = '—';
     encodeTimingStat.value.textContent = '—';
     encoderNote.hidden = true;
     encoderNote.textContent = '';
 
-    let encoderTap: VideoEncoderTap | null = null;
-
     try {
-      if (wantEncoder) {
-        logInfo('workbench', 'Creating VideoEncoder tap', {
-          width: config.width,
-          height: config.height,
-          fps: config.fps,
-          transfer: config.outputColorSpace.transfer,
-        });
-        const encoderWatchdog = setInterval(() => {
-          logWarn('workbench', 'VideoEncoder creation has not completed yet', {
-            waitingMs: Math.round(performance.now() - runStart),
-            pageVisibility:
-              typeof document !== 'undefined' ? document.visibilityState : 'unknown',
-          });
-        }, 5000);
-        try {
-          encoderTap = await createVideoEncoderTap(
-            createEncoderProbeMeta(config),
-            () => {
-              // Chunk data is intentionally dropped: muxing is out of scope.
-            },
-            {
-              // WebCodecs profiles are tagged Rec.2100 PQ or HLG; linear/unknown
-              // output descriptions fall back to PQ for the encoder metadata.
-              transfer: config.outputColorSpace.transfer === 'hlg' ? 'hlg' : 'pq',
-              onWarning: (message) => {
-                // The encoder tap already logs to the console; keep the fallback
-                // reason available in the UI after later warnings replace it.
-                showWarning(`Video encoder: ${message}`);
-              },
-              onInfo: (message) => {
-                encoderNote.hidden = false;
-                encoderNote.textContent = message;
-              },
-              onError: (error) => {
-                showWarning(`Video encoder: ${error.message}`);
-              },
-            },
-          );
-        } finally {
-          clearInterval(encoderWatchdog);
-        }
-
-        logInfo(
-          'workbench',
-          encoderTap ? 'VideoEncoder tap ready' : 'VideoEncoder tap unavailable',
-          encoderTap
-            ? {
-                codec: encoderTap.codec,
-                frameFormat: encoderTap.frameFormat,
-                state: encoderTap.status().state,
-              }
-            : undefined,
-        );
-
-        if (!encoderTap) {
-          // `createVideoEncoderTap` reports the specific reason through
-          // `onWarning`; only add a fallback when it was silent.
-          logInfo('workbench', 'Continuing without a VideoEncoder tap');
-          if (warningEl.hidden) {
-            showWarning(
-              'No supported 10-bit HDR VideoEncoder profile; continuing without encoding.',
-            );
-          }
-          updateEncoderReadout(null, true);
-        }
-      }
-
+      // The preview pass never encodes. Encoding is a separate, explicitly
+      // requested offline pass (see exportVideo) so a normal run pays no encoder
+      // cost and the preview cannot be throttled by encode back-pressure.
       const summary = await runFramePipeline({
         config,
         previewCanvas: canvas,
         signal: controller.signal,
-        encoderTap,
+        // No encoder tap: the preview pass is render-only.
+        encoderTap: null,
         callbacks: {
           onFrame: (frame: FloatFrame) => {
             returnedFrames++;
@@ -758,19 +970,14 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       setState('error', 'Error');
       showWarning(`Run failed: ${describeError(error)}`);
     } finally {
-      // Guarantees trailing chunks are emitted even if GPU setup failed before
-      // the pipeline's own flush block was reached. Idempotent.
-      await flushAndClose(encoderTap);
-      updateEncoderReadout(encoderTap?.status() ?? null, wantEncoder);
-
       if (activeController === controller) activeController = null;
       running = false;
       if (!unmounted) {
         startButton.disabled = !webgpuAvailable;
         cancelButton.disabled = true;
         formatSelect.disabled = false;
-        encoderToggle.disabled = !webCodecsAvailable;
         frameIndexInput.disabled = false;
+        exportButton.disabled = !webCodecsAvailable;
       }
     }
   }
@@ -791,9 +998,13 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     }
     activeController?.abort();
     activeController = null;
+    if (videoObjectUrl) {
+      URL.revokeObjectURL(videoObjectUrl);
+      videoObjectUrl = null;
+    }
     startButton.removeEventListener('click', onStartClick);
     cancelButton.removeEventListener('click', onCancelClick);
-    encoderToggle.removeEventListener('change', onEncoderToggleChange);
+    downloadVideoButton.removeEventListener('click', onDownloadVideoClick);
     downloadButton.removeEventListener('click', onDownloadClick);
     frameIndexInput.removeEventListener('change', onFrameIndexChange);
     container.remove();
@@ -807,19 +1018,14 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
     cancel();
   }
 
-  function onEncoderToggleChange(): void {
-    if (!running) {
-      updateEncoderReadout(null, encoderToggle.checked);
-      if (!encoderToggle.checked) {
-        encoderNote.hidden = true;
-        encoderNote.textContent = '';
-      }
-    }
+  function onExportClick(): void {
+    void exportVideo();
   }
 
   startButton.addEventListener('click', onStartClick);
   cancelButton.addEventListener('click', onCancelClick);
-  encoderToggle.addEventListener('change', onEncoderToggleChange);
+  exportButton.addEventListener('click', onExportClick);
+  downloadVideoButton.addEventListener('click', onDownloadVideoClick);
   downloadButton.addEventListener('click', onDownloadClick);
   frameIndexInput.addEventListener('change', onFrameIndexChange);
   updateEncoderReadout(null, false);

@@ -137,7 +137,7 @@ export interface RunFramePipelineOptions {
    * Canvas used for live preview presentation. Omit to run headless (readback only),
    * which is useful for tests and batch export.
    */
-  readonly previewCanvas?: HTMLCanvasElement;
+  readonly previewCanvas?: HTMLCanvasElement | null;
   /** Progress hooks. */
   readonly callbacks?: PipelineCallbacks;
   /** Cooperative cancellation; checked between frames. */

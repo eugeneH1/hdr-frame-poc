@@ -852,26 +852,40 @@ export async function createVideoEncoderTap(
   let config: HdrVideoEncoderConfig | null = null;
   let codec: string | null = null;
   const rejected: string[] = [];
+  const probes: Array<{ codec: string; supported: boolean; error?: string }> = [];
 
   for (const candidate of candidates) {
     const candidateConfig = buildEncoderConfig(candidate, meta, transfer, bitrate, fps);
     try {
       const support = await VideoEncoder.isConfigSupported(candidateConfig);
       if (support.supported) {
+        probes.push({ codec: candidate, supported: true });
         config = candidateConfig;
         codec = candidate;
         break;
       }
+      probes.push({ codec: candidate, supported: false });
       rejected.push(candidate);
-    } catch {
+    } catch (error) {
       // Invalid or unrecognized codec strings are treated as unsupported.
+      probes.push({ codec: candidate, supported: false, error: describeError(error) });
       rejected.push(candidate);
     }
   }
 
+  // Console-only (not `info`, which would overwrite the UI capability note).
+  // Codec availability differs sharply between browsers and can be affected by
+  // hardware-encoder exhaustion, so always record what was actually probed.
+  logInfo('encoder', 'Codec probe results', {
+    requested: candidates,
+    results: probes,
+    selected: codec ?? 'none',
+  });
+
   if (!config || !codec) {
     warn(
-      `No supported 10-bit HDR encoder profile (tried ${rejected.join(', ')}).`,
+      `No supported 10-bit HDR encoder profile (tried ${rejected.join(', ')}). ` +
+        'See the "Codec probe results" log for per-candidate support.',
     );
     return null;
   }
