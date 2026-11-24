@@ -23,6 +23,8 @@
  *   cluster duration for seeking.
  */
 
+import { computeChunkTiming } from './chunkTiming.ts';
+
 /** One encoded chunk plus the metadata that accompanied it. */
 export interface WebMChunk {
   readonly chunk: EncodedVideoChunk;
@@ -276,7 +278,10 @@ export function muxVideoToWebM(options: WebMOptions): MuxedWebM | null {
   }
 
   const { bitDepth } = parseVp9CodecString(codec);
-  const fallbackDurationUs = 1_000_000 / fps;
+
+  // Derive timing from presentation timestamps rather than trusting (or summing)
+  // the optional `duration` field; see `chunkTiming.ts` for why.
+  const timing = computeChunkTiming(chunks, fps);
 
   // --- header ---------------------------------------------------------------
   const ebml = element(
@@ -293,24 +298,28 @@ export function muxVideoToWebM(options: WebMOptions): MuxedWebM | null {
   );
 
   // --- Info -----------------------------------------------------------------
-  let elapsedUs = 0;
   const samples: Array<{
     data: Uint8Array;
     timestampMs: number;
     isKey: boolean;
   }> = [];
 
-  for (const { chunk } of chunks) {
+  // Prefer presentation timestamps when they are ordered; otherwise accumulate
+  // durations so block times stay monotonic for the player.
+  let cumulativeUs = 0;
+  for (let index = 0; index < chunks.length; index++) {
+    const { chunk } = chunks[index];
     const data = new Uint8Array(chunk.byteLength);
     chunk.copyTo(data);
+    const startUs = timing.monotonic ? timing.startsUs[index] : cumulativeUs;
     samples.push({
       data,
-      timestampMs: Math.round(elapsedUs / 1000),
+      timestampMs: Math.round(startUs / 1000),
       isKey: chunk.type === 'key',
     });
-    elapsedUs += chunk.duration ?? fallbackDurationUs;
+    cumulativeUs += timing.durationsUs[index];
   }
-  const durationMs = elapsedUs / 1000;
+  const durationMs = timing.totalUs / 1000;
 
   const info = element(
     ID_INFO,
@@ -440,7 +449,7 @@ export function muxVideoToWebM(options: WebMOptions): MuxedWebM | null {
     extension: 'webm',
     codecFamily: 'vp9',
     frameCount: samples.length,
-    durationSeconds: durationMs / 1000,
+    durationSeconds: timing.totalUs / 1_000_000,
   };
 }
 

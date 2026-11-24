@@ -23,6 +23,7 @@
  */
 
 import { logDebug } from '../diagnostics/logger.ts';
+import { computeChunkTiming } from './chunkTiming.ts';
 
 /** One encoded chunk plus the metadata that accompanied it. */
 export interface MuxVideoChunk {
@@ -590,26 +591,26 @@ export function muxVideoToMp4(options: MuxVideoOptions): MuxedVideo | null {
 
   const MOVIE_TIMESCALE = 1000;
   const MEDIA_TIMESCALE = 90000;
-  const fallbackDurationUs = 1_000_000 / fps;
+
+  // Derive timing from presentation timestamps rather than trusting (or summing)
+  // the optional `duration` field; see `chunkTiming.ts` for why.
+  const timing = computeChunkTiming(chunks, fps);
 
   const sampleBytes: Uint8Array[] = [];
   const samples: SampleRecord[] = [];
   let mdatPayloadSize = 0;
-  let elapsedUs = 0;
 
-  for (const { chunk } of chunks) {
+  chunks.forEach(({ chunk }, index) => {
     const data = new Uint8Array(chunk.byteLength);
     chunk.copyTo(data);
-    const durationUs = chunk.duration ?? fallbackDurationUs;
     samples.push({
-      durationTimescale: microsecondsToTimescale(durationUs, MEDIA_TIMESCALE),
+      durationTimescale: microsecondsToTimescale(timing.durationsUs[index], MEDIA_TIMESCALE),
       size: data.length,
       isKey: chunk.type === 'key',
     });
     sampleBytes.push(data);
     mdatPayloadSize += data.length;
-    elapsedUs += durationUs;
-  }
+  });
 
   // WebCodecs only attaches `decoderConfig` when the configuration changes, so
   // the first chunk carrying a description is the authoritative one. Chrome's
@@ -636,7 +637,7 @@ export function muxVideoToMp4(options: MuxVideoOptions): MuxedVideo | null {
   }
 
   const mediaDuration = samples.reduce((sum, sample) => sum + sample.durationTimescale, 0);
-  const movieDuration = microsecondsToTimescale(elapsedUs, MOVIE_TIMESCALE);
+  const movieDuration = microsecondsToTimescale(timing.totalUs, MOVIE_TIMESCALE);
 
   const ftyp = box(
     'ftyp',
@@ -687,6 +688,6 @@ export function muxVideoToMp4(options: MuxVideoOptions): MuxedVideo | null {
     extension: 'mp4',
     codecFamily: family,
     frameCount: samples.length,
-    durationSeconds: elapsedUs / 1_000_000,
+    durationSeconds: timing.totalUs / 1_000_000,
   };
 }

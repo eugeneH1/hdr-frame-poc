@@ -34,6 +34,7 @@ import type { VideoEncoderTap } from '../encoder/webCodecsTap.ts';
 import { canMuxVideo, muxVideo } from '../encoder/videoContainer.ts';
 import type { MuxedVideoFile, MuxVideoChunk } from '../encoder/videoContainer.ts';
 import { renderComparisonFrame } from '../encoder/videoComparison.ts';
+import { computeChunkTiming } from '../encoder/chunkTiming.ts';
 import { describeLogging, logDebug, logError, logInfo, logWarn } from '../diagnostics/logger.ts';
 
 const DEFAULT_WIDTH = 1280;
@@ -721,6 +722,9 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
       updateEncoderReadout(tap.status(), true);
       setState(summary.cancelled ? 'cancelled' : 'done', summary.cancelled ? 'Cancelled' : 'Complete');
 
+      // Timing is derived from chunk timestamps, not summed durations; logging
+      // it makes an off-by-one-frame shortfall immediately visible.
+      const timing = computeChunkTiming(videoChunks, config.fps);
       logInfo('workbench', 'Export complete', {
         framesEncoded: summary.framesCompleted,
         chunks: videoChunks.length,
@@ -729,6 +733,10 @@ export function mountWorkbench(options: WorkbenchOptions): Workbench {
         codec: tap.codec,
         frameFormat: tap.frameFormat,
         elapsedMs: Math.round(summary.elapsedMs),
+        encodedDurationSeconds: Number((timing.totalUs / 1_000_000).toFixed(3)),
+        expectedDurationSeconds: config.frameCount / config.fps,
+        chunkTimestampsMonotonic: timing.monotonic,
+        lastChunkDurationUs: videoChunks[videoChunks.length - 1]?.chunk.duration ?? null,
       });
 
       if (!summary.cancelled && videoChunks.length > 0) {
